@@ -186,6 +186,10 @@ impl<K: Ord, V> BTree<K, V> {
         });
         self.root = new_root;
     }
+
+    pub fn iter(&self) -> BTreeIter<'_, K, V> {
+        BTreeIter::new(self)
+    }
 }
 
 enum PutResult<K: Ord, V> {
@@ -193,6 +197,72 @@ enum PutResult<K: Ord, V> {
     Split {
         promoted_kv: (K, V),
         right_sibling: Node<K, V>
+    }
+}
+
+pub struct BTreeIter<'a, K: Ord, V> {
+    cursor: Option<(&'a Node<K, V>, usize)>,
+    just_entered_inode: bool,
+    parents: Vec<(&'a Node<K, V>, usize)>
+}
+
+impl <'a, K: Ord, V> BTreeIter<'a, K, V> {
+    fn new(tree: &'a BTree<K, V>) -> Self {
+        match &tree.root {
+            Node::LNode(lnode) => Self {
+                cursor: if lnode.kvs.is_empty() { None } else { Some((&tree.root, 0)) },
+                parents: Vec::new(),
+                just_entered_inode: false,
+            },
+            Node::INode(_) => Self {
+                cursor: Some((&tree.root, 0)),
+                parents: Vec::new(),
+                just_entered_inode: true,
+            }
+        }
+    }
+}
+
+impl <'a, K: Ord, V> iter::Iterator for BTreeIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (mut node, idx) = self.cursor?;
+        match node {
+            Node::LNode(lnode) => {
+                let (k, v) = &lnode.kvs[idx];
+                if idx == lnode.kvs.len() - 1 {
+                    self.cursor = self.parents.pop();
+                } else {
+                    self.cursor = Some((node, idx + 1));
+                }
+                Some((k, v))
+            }
+            Node::INode(inode) => {
+                if self.just_entered_inode {
+                    while let Node::INode(inode) = node {
+                        self.parents.push((node, 0));
+                        node = &inode.children[0].0;
+                    }
+                    self.cursor = Some((node, 0));
+                    self.just_entered_inode = false;
+                    self.next()
+                } else {
+                    let (k, v) = &inode.children[idx].1;
+                    let next_node = if idx == inode.children.len() - 1 {
+                        &inode.trailing_child
+                    } else {
+                        self.parents.push((node, idx + 1));
+                        &inode.children[idx + 1].0
+                    };
+                    if let Node::INode(_) = next_node {
+                        self.just_entered_inode = true;
+                    }
+                    self.cursor = Some((next_node, 0));
+                    Some((k, v))
+                }
+            }
+        }
     }
 }
 
@@ -221,10 +291,44 @@ mod tests {
 
         assert_eq!(tree.get(&(NUM_VALUES + 1)), None);
     }
-        }
 
-        for k in 11..20 {
-            assert_eq!(tree.get(&k), None);
+    #[test]
+    fn iter_next() {
+        let degree = rand::random_range(2..10);
+        println!("using degree {}", degree);
+        const NUM_VALUES: i32 = 100;
+        #[derive(Debug)]
+        enum InsertOrder {
+            Ordered,
+            Reverse,
+            Random
+        }
+        let orders = [InsertOrder::Ordered, InsertOrder::Reverse, InsertOrder::Random];
+        for order in orders {
+            println!("inserting in {:?} order", order);
+            let mut tree = BTree::<i32, i32>::new(degree);
+            let to_insert: Vec<i32> = match order {
+                InsertOrder::Ordered => (1..=NUM_VALUES).collect(),
+                InsertOrder::Reverse => (1..=NUM_VALUES).rev().collect(),
+                InsertOrder::Random => {
+                    let mut v: Vec<i32> = (1..=NUM_VALUES).collect();
+                    v.shuffle(&mut rng());
+                    v
+                }
+            };
+            for x in to_insert {
+                tree.put(x, x);
+            }
+
+            let mut it = tree.iter();
+            for x in 1..=NUM_VALUES {
+                let next = it.next();
+                let Some((k, v)) = next else {
+                    panic!("expected Some({}) from iter, received None", x)
+                };
+                assert_eq!(x, *k);
+                assert_eq!(x, *v);
+            }
         }
     }
 }
