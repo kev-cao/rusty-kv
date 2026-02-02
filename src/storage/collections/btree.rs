@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::cmp::Ordering;
+use std::iter;
 use std::mem;
 
 enum Node<K: Ord, V> {
@@ -21,37 +21,33 @@ struct LNode<K: Ord, V> {
 }
 
 impl<K: Ord, V> LNode<K, V> {
-    fn is_full(&self, degree:usize) -> bool {
-        self.kvs.len() >= 2 * degree - 1
+    fn should_split(&self, degree:usize) -> bool {
+        self.kvs.len() >= 2 * degree
     }
 
     fn put(&mut self, key: K, value: V, degree: usize) -> PutResult<K, V> {
-        if self.is_full(degree) {
-            let (mut promoted_kv, mut right_sibling)= self.split();
-            match key.cmp(&promoted_kv.0) {
-                Ordering::Less => { self.put(key, value, degree); },
-                Ordering::Greater => { right_sibling.put(key, value, degree); },
-                Ordering::Equal => { promoted_kv.1 = value; },
-            };
-            return PutResult::Split{
-                promoted_kv,
-                right_sibling: Node::LNode(right_sibling)
-            };
-        }
-        match self.kvs.binary_search_by(|&(ref probe, _)| probe.cmp(&key)) {
+        match self.kvs.binary_search_by(|(probe, _)| probe.cmp(&key)) {
             Ok(idx) => self.kvs[idx].1 = value,
             Err(idx) => self.kvs.insert(idx, (key, value))
         }
-        PutResult::Success
+        if !self.should_split(degree) {
+            return PutResult::Success
+        }
+        let (promoted_kv, right_sibling)= self.split();
+        PutResult::Split{
+            promoted_kv,
+            right_sibling: Node::LNode(right_sibling)
+        }
     }
 
-    /// Splits the leaf node at the mid point. This assumes that the leaf node is full.
+    /// Splits the leaf node at the mid point. This assumes that the leaf node
+    /// needs to be split.
     ///
     /// # Returns
-    /// The extract median KV, and the right sibling.
+    /// The extracted median KV, and the right sibling.
     fn split(&mut self) -> ((K, V), LNode<K, V>){
         let mid = self.kvs.len() / 2;
-        let right_half = self.kvs.split_off(mid+1);
+        let right_half = self.kvs.split_off(mid);
         let mid_kv = self.kvs
             .pop()
             .expect("should not happen: node with split with less than 3 elements");
@@ -65,39 +61,56 @@ struct INode<K: Ord, V> {
 }
 
 impl<K: Ord, V> INode<K, V> {
-    fn is_full(&self, degree:usize) -> bool {
-        self.children.len() >= 2 * degree - 1
+    fn should_split(&self, degree:usize) -> bool {
+        self.children.len() >= 2 * degree
     }
 
     fn put(&mut self, key: K, value: V, degree: usize) -> PutResult<K, V> {
-        if self.is_full(degree) {
-            let (mut promoted_kv, mut right_sibling) = self.split();
-            match key.cmp(&promoted_kv.0) {
-                Ordering::Less => { self.put(key, value, degree); },
-                Ordering::Greater => { right_sibling.put(key, value, degree); },
-                Ordering::Equal => { promoted_kv.1 = value },
+        let mut insert_idx: usize = 0;
+        let put_result = match self.children.binary_search_by(|(_, probe)| probe.0.cmp(&key)) {
+            Ok(idx) => {
+                self.children[idx].1.1 = value;
+                PutResult::Success
             }
-            return PutResult::Split{
-                promoted_kv,
-                right_sibling: Node::INode(right_sibling),
-            };
-        }
-        match self.children.binary_search_by(|&(_, ref probe)| probe.0.cmp(&key)) {
-            Ok(idx) => self.children[idx].1.1 = value,
             Err(idx) => {
+                insert_idx = idx;
                 if idx == self.children.len() {
-                    self.trailing_child.put(key, value, degree);
+                    self.trailing_child.put(key, value, degree)
                 } else {
-                    self.children[idx].0.put(key, value, degree);
+                    self.children[idx].0.put(key, value, degree)
                 }
             }
         };
-        PutResult::Success
+
+        let PutResult::Split { promoted_kv, right_sibling  } = put_result else {
+            return put_result;
+        };
+
+        let mut new_child = (right_sibling, promoted_kv);
+        mem::swap(
+            &mut new_child.0,
+            if insert_idx == self.children.len() {
+                &mut self.trailing_child
+            } else {
+                &mut self.children[insert_idx].0
+            },
+        );
+        self.children.insert(insert_idx, new_child);
+
+        if !self.should_split(degree) {
+            return PutResult::Success;
+        }
+
+        let (promoted_kv, right_sibling) = self.split();
+        PutResult::Split{
+            promoted_kv,
+            right_sibling: Node::INode(right_sibling),
+        }
     }
 
     fn split(&mut self) -> ((K, V), INode<K, V>){
         let mid = self.children.len() / 2;
-        let right_half = self.children.split_off(mid+1);
+        let right_half = self.children.split_off(mid);
         let (mid_prior, mid_kv) = self.children
             .pop()
             .expect("should not happen: node with split with less than 3 elements");
@@ -117,7 +130,7 @@ pub struct BTree<K: Ord, V> {
 impl<K: Ord, V> BTree<K, V> {
     pub fn new(degree: usize) -> Self {
         Self {
-            degree: degree,
+            degree,
             root: Node::LNode(LNode {
                 kvs: Vec::new()
             })
@@ -141,11 +154,11 @@ impl<K: Ord, V> BTree<K, V> {
         loop {
             match curr_node {
                 Node::LNode(lnode) => {
-                    let res = lnode.kvs.binary_search_by(|&(ref probe, _)| probe.borrow().cmp(key));
+                    let res = lnode.kvs.binary_search_by(|(probe, _)| probe.borrow().cmp(key));
                     return if let Ok(idx) = res { Some(&lnode.kvs[idx].1) } else { None };
                 },
                 Node::INode(inode) => {
-                    let res = inode.children.binary_search_by(|&(_, ref probe)| probe.0.borrow().cmp(key));
+                    let res = inode.children.binary_search_by(|(_, probe)| probe.0.borrow().cmp(key));
                     match res {
                         Ok(idx) => return Some(&inode.children[idx].1.1),
                         Err(idx) if idx < inode.children.len() => {
@@ -192,29 +205,22 @@ mod tests {
     #[test]
     fn put_get_roundtrip() {
         const DEGREE: usize = 4;
+        const NUM_VALUES: i32 = 100;
         let mut tree = BTree::<i32, String>::new(DEGREE);
+        let mut keys: Vec<i32> = (1..=NUM_VALUES).collect();
+        keys.shuffle(&mut rng());
 
-        let mut kvs = vec![
-            (1, "one".to_string()),
-            (2, "two".to_string()),
-            (3, "three".to_string()),
-            (4, "four".to_string()),
-            (5, "five".to_string()),
-            (6, "six".to_string()),
-            (7, "seven".to_string()),
-            (8, "eight".to_string()),
-            (9, "nine".to_string()),
-            (10, "ten".to_string()),
-        ];
-        kvs.shuffle(&mut rng());
-
-        for (k, v) in &kvs {
-            tree.put(*k, v.clone());
-            assert_eq!(tree.get(k), Some(v));
+        for k in &keys {
+            tree.put(*k, k.to_string());
+            assert_eq!(tree.get(k), Some(&k.to_string()));
         }
 
-        for (k, v) in &kvs {
-            assert_eq!(tree.get(k), Some(v));
+        for k in &keys {
+            assert_eq!(tree.get(k), Some(&k.to_string()));
+        }
+
+        assert_eq!(tree.get(&(NUM_VALUES + 1)), None);
+    }
         }
 
         for k in 11..20 {
