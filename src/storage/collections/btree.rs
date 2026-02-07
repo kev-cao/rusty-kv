@@ -8,6 +8,7 @@ enum Node<K: Ord, V> {
 }
 
 impl<K: Ord, V> Node<K, V> {
+    /// Fetches the value associated with the provided key, if it exists.
     fn get<Q>(&self, key: &Q) -> Option<&V>
         where K: Borrow<Q>,
               Q: Ord + ?Sized
@@ -18,6 +19,7 @@ impl<K: Ord, V> Node<K, V> {
         }
     }
 
+    /// Inserts a key/value pair into the node.
     fn put(&mut self, key: K, value: V, degree: usize) -> PutResult<K, V> {
         match self {
             Node::LNode(lnode) => lnode.put(key, value, degree),
@@ -38,10 +40,13 @@ struct LNode<K: Ord, V> {
 }
 
 impl<K: Ord, V> LNode<K, V> {
+    /// Returns true if the leaf node has reached the maximum capacity and
+    /// needs to be split.
     fn should_split(&self, degree:usize) -> bool {
         self.kvs.len() >= 2 * degree
     }
 
+    /// Fetches the value associated with the provided key, if it exists.
     fn get<Q>(&self, key: &Q) -> Option<&V>
         where K: Borrow<Q>,
               Q: Ord + ?Sized
@@ -51,6 +56,7 @@ impl<K: Ord, V> LNode<K, V> {
             .map(|idx| &self.kvs[idx].1)
     }
 
+    /// Inserts a key/value pair into the node.
     fn put(&mut self, key: K, value: V, degree: usize) -> PutResult<K, V> {
         match self.kvs.binary_search_by(|(probe, _)| probe.cmp(&key)) {
             Ok(idx) => self.kvs[idx].1 = value,
@@ -89,10 +95,14 @@ struct INode<K: Ord, V> {
 }
 
 impl<K: Ord, V> INode<K, V> {
+    /// Returns true if the internal node has reached the maximum capacity and
+    /// needs to be split.
     fn should_split(&self, degree:usize) -> bool {
         self.kvs.len() >= 2 * degree
     }
 
+
+    /// Fetches the value associated with the provided key, if it exists.
     fn get<Q>(&self, key: &Q) -> Option<&V>
         where K: Borrow<Q>,
               Q: Ord + ?Sized
@@ -103,6 +113,7 @@ impl<K: Ord, V> INode<K, V> {
         }
     }
 
+    /// Inserts a key/value pair into the node.
     fn put(&mut self, key: K, value: V, degree: usize) -> PutResult<K, V> {
         let Err(ins_idx) = self.kvs.binary_search_by(|(probe, _)| probe.cmp(&key)) else {
             return PutResult::Success
@@ -127,6 +138,11 @@ impl<K: Ord, V> INode<K, V> {
         }
     }
 
+    /// Splits the internal node at the mid point. This assumes that the
+    /// internal node needs to be split.
+    ///
+    /// # Returns
+    /// The extracted median KV, and the right sibling.
     fn split(&mut self) -> ((K, V), INode<K, V>){
         let mid = self.kvs.len() / 2;
         let right_kvs = self.kvs.split_off(mid);
@@ -156,6 +172,7 @@ pub struct BTree<K: Ord, V> {
 }
 
 impl<K: Ord, V> BTree<K, V> {
+    /// Constructs a new btree with the provided degree.
     pub fn new(degree: usize) -> Self {
         Self {
             degree,
@@ -206,6 +223,7 @@ enum IterFrame<'a, K: Ord, V> {
 }
 
 impl<'a, K: Ord, V> IterFrame<'a, K, V> {
+    /// Wraps a BTree Node in an IterFrame.
     fn from_node(node: &'a Node<K, V>) -> Self {
         match node {
             Node::LNode(lnode) => Self::LNode(lnode, 0),
@@ -219,6 +237,7 @@ pub struct BTreeIter<'a, K: Ord, V> {
 }
 
 impl <'a, K: Ord, V> BTreeIter<'a, K, V> {
+    /// Constructs a new iterator from a BTree.
     fn new(btree: &'a BTree<K, V>) -> Self {
         Self {
             stack: vec![IterFrame::from_node(&btree.root)]
@@ -229,6 +248,7 @@ impl <'a, K: Ord, V> BTreeIter<'a, K, V> {
 impl <'a, K: Ord, V> iter::Iterator for BTreeIter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
+    /// Returns the next key/value pair in the BTree.
     fn next(&mut self) -> Option<Self::Item> {
         let mut frame = self.stack.pop()?;
 
