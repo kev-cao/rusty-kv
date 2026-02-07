@@ -1,4 +1,4 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::iter;
 use std::mem;
 
@@ -16,6 +16,13 @@ impl<K: Ord, V> Node<K, V> {
     }
 }
 
+impl <K: Ord, V> Default for Node<K, V> {
+    fn default() -> Self {
+        Self::LNode(LNode{kvs: Vec::new() })
+    }
+}
+
+#[derive(Default)]
 struct LNode<K: Ord, V> {
     kvs: Vec<(K, V)>
 }
@@ -55,6 +62,7 @@ impl<K: Ord, V> LNode<K, V> {
     }
 }
 
+#[derive(Default)]
 struct INode<K: Ord, V> {
     children: Vec<(Node<K, V>, (K, V))>,
     trailing_child: Box<Node<K, V>>
@@ -119,6 +127,14 @@ impl<K: Ord, V> INode<K, V> {
             trailing_child: mem::replace(&mut self.trailing_child, Box::new(mid_prior)),
         };
         (mid_kv, right_sibling)
+    }
+}
+
+enum PutResult<K: Ord, V> {
+    Success,
+    Split {
+        promoted_kv: (K, V),
+        right_sibling: Node<K, V>
     }
 }
 
@@ -192,33 +208,28 @@ impl<K: Ord, V> BTree<K, V> {
     }
 }
 
-enum PutResult<K: Ord, V> {
-    Success,
-    Split {
-        promoted_kv: (K, V),
-        right_sibling: Node<K, V>
+enum IterFrame<'a, K: Ord, V> {
+    LNode(&'a LNode<K, V>, usize),
+    INode(&'a INode<K, V>, usize)
+}
+
+impl<'a, K: Ord, V> IterFrame<'a, K, V> {
+    fn from_node(node: &'a Node<K, V>) -> Self {
+        match node {
+            Node::LNode(lnode) => Self::LNode(lnode, 0),
+            Node::INode(inode) => Self::INode(inode, 0),
+        }
     }
 }
 
 pub struct BTreeIter<'a, K: Ord, V> {
-    cursor: Option<(&'a Node<K, V>, usize)>,
-    just_entered_inode: bool,
-    parents: Vec<(&'a Node<K, V>, usize)>
+    stack: Vec<IterFrame<'a, K, V>>
 }
 
 impl <'a, K: Ord, V> BTreeIter<'a, K, V> {
-    fn new(tree: &'a BTree<K, V>) -> Self {
-        match &tree.root {
-            Node::LNode(lnode) => Self {
-                cursor: if lnode.kvs.is_empty() { None } else { Some((&tree.root, 0)) },
-                parents: Vec::new(),
-                just_entered_inode: false,
-            },
-            Node::INode(_) => Self {
-                cursor: Some((&tree.root, 0)),
-                parents: Vec::new(),
-                just_entered_inode: true,
-            }
+    fn new(btree: &'a BTree<K, V>) -> Self {
+        Self {
+            stack: vec![IterFrame::from_node(&btree.root)]
         }
     }
 }
@@ -227,38 +238,36 @@ impl <'a, K: Ord, V> iter::Iterator for BTreeIter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (mut node, idx) = self.cursor?;
-        match node {
-            Node::LNode(lnode) => {
-                let (k, v) = &lnode.kvs[idx];
-                if idx == lnode.kvs.len() - 1 {
-                    self.cursor = self.parents.pop();
-                } else {
-                    self.cursor = Some((node, idx + 1));
+        let mut frame = self.stack.pop()?;
+
+        match frame {
+            IterFrame::LNode(lnode, ref mut cursor) => {
+                let (k, v) = &lnode.kvs[*cursor];
+                *cursor += 1;
+                if *cursor != lnode.kvs.len() {
+                    self.stack.push(frame);
                 }
                 Some((k, v))
-            }
-            Node::INode(inode) => {
-                if self.just_entered_inode {
-                    while let Node::INode(inode) = node {
-                        self.parents.push((node, 0));
-                        node = &inode.children[0].0;
-                    }
-                    self.cursor = Some((node, 0));
-                    self.just_entered_inode = false;
+            },
+            IterFrame::INode(inode, ref mut cursor) => {
+                // Keep in mind that the cursor is double the index in .children
+                // because the children are interleaved with the values.
+                if *cursor % 2 == 0 {
+                    let child_to_push = if *cursor < inode.children.len() * 2 {
+                        *cursor += 1;
+                        let child = &inode.children[*cursor / 2].0;
+                        self.stack.push(frame);
+                        child
+                    } else {
+                        &inode.trailing_child
+                    };
+
+                    self.stack.push(IterFrame::from_node(child_to_push));
                     self.next()
                 } else {
-                    let (k, v) = &inode.children[idx].1;
-                    let next_node = if idx == inode.children.len() - 1 {
-                        &inode.trailing_child
-                    } else {
-                        self.parents.push((node, idx + 1));
-                        &inode.children[idx + 1].0
-                    };
-                    if let Node::INode(_) = next_node {
-                        self.just_entered_inode = true;
-                    }
-                    self.cursor = Some((next_node, 0));
+                    let (k, v) = &inode.children[*cursor / 2].1;
+                    *cursor += 1;
+                    self.stack.push(frame);
                     Some((k, v))
                 }
             }
