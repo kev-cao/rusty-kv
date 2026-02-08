@@ -3,6 +3,8 @@ use std::iter::{IntoIterator, Iterator};
 use std::mem;
 use std::vec;
 
+use crate::storage::collections::MapIterator;
+
 enum Node<K: Ord, V> {
     LNode(LNode<K, V>),
     INode(INode<K,V>),
@@ -243,6 +245,7 @@ impl<'a, K: Ord, V> IterFrame<'a, K, V> {
 }
 
 pub struct BTreeIter<'a, K: Ord, V> {
+    root: &'a Node<K, V>,
     stack: Vec<IterFrame<'a, K, V>>
 }
 
@@ -250,6 +253,7 @@ impl <'a, K: Ord, V> BTreeIter<'a, K, V> {
     /// Constructs a new iterator from a BTree.
     fn new(btree: &'a BTree<K, V>) -> Self {
         Self {
+            root: &btree.root,
             stack: vec![IterFrame::from_node(&btree.root)]
         }
     }
@@ -287,6 +291,56 @@ impl <'a, K: Ord, V> Iterator for BTreeIter<'a, K, V> {
                         self.stack.push(frame);
                         return Some((k, v));
                     }
+                }
+            };
+        }
+    }
+}
+
+impl <'a, K: Ord, V> MapIterator<'a, K> for BTreeIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn seek<Q>(&mut self, key: &Q) -> Option<Self::Item>
+        where K: Borrow<Q>,
+              Q: Ord + ?Sized
+    {
+        self.stack.clear();
+        self.stack.push(IterFrame::from_node(self.root));
+
+        loop {
+            let mut frame = self.stack.pop()?;
+            match frame {
+                IterFrame::LNode(lnode, ref mut cursor) => {
+                    let idx = match lnode.kvs.binary_search_by(|(probe, _)| probe.borrow().cmp(key)) {
+                        Ok(idx) | Err(idx) => idx,
+                    };
+                    if idx < lnode.kvs.len() {
+                        let (k, v) = &lnode.kvs[idx];
+                        *cursor = idx + 1;
+                        if *cursor < lnode.kvs.len() {
+                            self.stack.push(frame);
+                        }
+                        return Some((k, v));
+                    } else {
+                        return self.next();
+                    }
+                },
+                IterFrame::INode(inode, ref mut cursor) => {
+                    match inode.kvs.binary_search_by(|(probe, _)| probe.borrow().cmp(key)) {
+                        Ok(idx) => {
+                            let (k, v) = &inode.kvs[idx];
+                            *cursor = (idx + 1) * 2;
+                            self.stack.push(frame);
+                            return Some((k, v));
+                        },
+                        Err(idx) => {
+                            *cursor = idx * 2 + 1;
+                            if idx < inode.kvs.len() {
+                                self.stack.push(frame);
+                            }
+                            self.stack.push(IterFrame::from_node(&inode.children[idx]));
+                        }
+                    };
                 }
             };
         }
@@ -376,7 +430,7 @@ impl <K: Ord, V> Iterator for OwnedBTreeIter<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rng;
+    use rand::{Rng, rng};
     use rand::seq::SliceRandom;
 
     #[test]
@@ -475,6 +529,79 @@ mod tests {
                 };
                 assert_eq!(x, k);
                 assert_eq!(x, v);
+            }
+        }
+    }
+
+    #[test]
+    fn seek() {
+        let degree = rand::random_range(2..10);
+        println!("using degree {}", degree);
+        const NUM_VALUES: i32 = 100;
+        #[derive(Debug)]
+        enum InsertOrder {
+            Ordered,
+            Reverse,
+            Random
+        }
+
+        let orders = [InsertOrder::Ordered, InsertOrder::Reverse, InsertOrder::Random];
+        for order in orders {
+            println!("inserting in {:?} order", order);
+            let mut tree = BTree::<i32, i32>::new(degree);
+            let to_insert: Vec<i32> = match order {
+                InsertOrder::Ordered => (1..=NUM_VALUES * 2).step_by(2).collect(),
+                InsertOrder::Reverse => (1..=NUM_VALUES * 2 - 1).rev().step_by(2).collect(),
+                InsertOrder::Random => {
+                    let mut v: Vec<i32> = (1..=NUM_VALUES * 2).step_by(2).collect();
+                    v.shuffle(&mut rng());
+                    v
+                }
+            };
+            for x in to_insert {
+                tree.put(x, x);
+            }
+
+            let start = rng().random_range(1..NUM_VALUES * 2 - 1);
+            let mut start_odd = start;
+            let mut start_even = start + 1;
+            if start_even % 2 != 0 {
+                (start_odd, start_even) = (start_even, start_odd);
+            }
+
+            println!("start_odd = {}, start_even = {}", start_odd, start_even);
+
+            let mut it = tree.iter();
+            let next = it.seek(&start_odd);
+            let Some((k, v)) = next else {
+                panic!("expected Some({}) from iter, received None", start_odd)
+            };
+            assert_eq!(start_odd, *k);
+            assert_eq!(start_odd, *v);
+
+            for x in (start_odd+2..=NUM_VALUES * 2).step_by(2) {
+                let next = it.next();
+                let Some((k, v)) = next else {
+                    panic!("expected Some({}) from iter, received None", x)
+                };
+                assert_eq!(x, *k);
+                assert_eq!(x, *v);
+            }
+
+
+            let next = it.seek(&start_even);
+            let Some((k, v)) = next else {
+                panic!("expected Some({}) from iter, received None", start_odd)
+            };
+            assert_eq!(start_even + 1, *k);
+            assert_eq!(start_even + 1, *v);
+            for x in (start_even+3..=NUM_VALUES * 2).step_by(2) {
+                let next = it.next();
+                let Some((k, v)) = next else {
+                    panic!("expected Some({}) from iter, received None", x)
+                };
+                assert_eq!(x, *k);
+                assert_eq!(x, *v);
             }
         }
     }

@@ -5,14 +5,13 @@ pub mod btree;
 pub trait MemTable {
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>);
 
-    fn get<K: Borrow<[u8]>>(&self, key: K) -> Option<&Vec<u8>>;
+    fn get<K>(&self, key: K) -> Option<&Vec<u8>> where K: Borrow<[u8]> + Ord;
 
-    fn iter<'a>(&'a self) -> impl MapIterator<'a, Key = Vec<u8>, Value = Vec<u8>>;
+    fn iter<'a, K>(&'a self) -> impl MapIterator<'a, K> where K: Borrow<[u8]> + Ord;
 }
 
-pub trait MapIterator<'a> {
-    type Key: Ord;
-    type Value;
+pub trait MapIterator<'a, K: Ord> {
+    type Item;
 
-    fn next(&mut self) -> Option<(&'a Self::Key, &'a Self::Value)>;
+    fn seek<Q>(&mut self, key: &Q) -> Option<Self::Item> where K: Borrow<Q>, Q: Ord + ?Sized;
 }
