@@ -260,33 +260,35 @@ impl <'a, K: Ord, V> Iterator for BTreeIter<'a, K, V> {
 
     /// Returns the next key/value pair in the BTree.
     fn next(&mut self) -> Option<Self::Item> {
-        let mut frame = self.stack.pop()?;
+        loop {
+            let mut frame = self.stack.pop()?;
 
-        match frame {
-            IterFrame::LNode(lnode, ref mut cursor) => {
-                let (k, v) = &lnode.kvs[*cursor];
-                *cursor += 1;
-                if *cursor != lnode.kvs.len() {
-                    self.stack.push(frame);
-                }
-                Some((k, v))
-            },
-            IterFrame::INode(inode, ref mut cursor) => {
-                if *cursor % 2 == 0 {
-                    let to_push = *cursor / 2;
+            match frame {
+                IterFrame::LNode(lnode, ref mut cursor) => {
+                    let (k, v) = &lnode.kvs[*cursor];
                     *cursor += 1;
-                    if *cursor <= inode.kvs.len() * 2 {
-                        self.stack.push(frame)
+                    if *cursor != lnode.kvs.len() {
+                        self.stack.push(frame);
                     }
-                    self.stack.push(IterFrame::from_node(&inode.children[to_push]));
-                    self.next()
-                } else {
-                    let (k, v) = &inode.kvs[*cursor / 2];
-                    *cursor += 1;
-                    self.stack.push(frame);
-                    Some((k, v))
+                    return Some((k, v))
+                },
+                IterFrame::INode(inode, ref mut cursor) => {
+                    if *cursor % 2 == 0 {
+                        let to_push = *cursor / 2;
+                        *cursor += 1;
+                        if *cursor <= inode.kvs.len() * 2 {
+                            self.stack.push(frame)
+                        }
+                        self.stack.push(IterFrame::from_node(&inode.children[to_push]));
+                        continue;
+                    } else {
+                        let (k, v) = &inode.kvs[*cursor / 2];
+                        *cursor += 1;
+                        self.stack.push(frame);
+                        return Some((k, v));
+                    }
                 }
-            }
+            };
         }
     }
 }
@@ -327,44 +329,46 @@ impl <K: Ord, V> Iterator for OwnedBTreeIter<K, V> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut frame = self.stack.pop()?;
+        loop {
+            let mut frame = self.stack.pop()?;
 
-        match frame {
-            OwnedFrame::LNode(ref mut lnode) => {
-                match lnode.next() {
-                    Some(kv) => {
-                        self.stack.push(frame);
-                        Some(kv)
-                    },
-                    None => {
-                        self.next()
-                    }
-                }
-            },
-            OwnedFrame::INode{
-                ref mut kvs,
-                ref mut children,
-                ref mut next_is_child,
-            } => {
-                let push_child = *next_is_child;
-                *next_is_child = !*next_is_child;
-                if push_child {
-                    match children.next() {
-                        None => self.next(),
-                        Some(c) => {
-                            self.stack.push(frame);
-                            self.push_node(c);
-                            self.next()
-                        }
-                    }
-                } else {
-                    let Some(kv) = kvs.next() else {
-                        return self.next();
+            match frame {
+                OwnedFrame::LNode(ref mut lnode) => {
+                    let Some(kv) = lnode.next() else {
+                        continue;
                     };
-                    self.stack.push(frame);
-                    Some(kv)
+                    if !lnode.as_slice().is_empty() {
+                        self.stack.push(frame);
+                    }
+                    return Some(kv);
+                },
+                OwnedFrame::INode{
+                    ref mut kvs,
+                    ref mut children,
+                    ref mut next_is_child,
+                } => {
+                    let push_child = *next_is_child;
+                    *next_is_child = !*next_is_child;
+                    if push_child {
+                        match children.next() {
+                            None => continue,
+                            Some(c) => {
+                                if !children.as_slice().is_empty() {
+                                    self.stack.push(frame);
+                                }
+                                self.push_node(c);
+                                continue;
+                            }
+                        }
+                    } else {
+                        let Some(kv) = kvs.next() else {
+                            continue;
+                        };
+                        self.stack.push(frame);
+                        return Some(kv);
+                    }
                 }
-            }
+            };
         }
     }
 }
