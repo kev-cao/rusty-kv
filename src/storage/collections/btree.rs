@@ -2,8 +2,7 @@ use std::borrow::Borrow;
 use std::iter::{IntoIterator, Iterator};
 use std::mem;
 use std::vec;
-
-use crate::storage::collections::MapIterator;
+use super::{KVStore, SeekableIterator};
 
 enum Node<K: Ord, V> {
     LNode(LNode<K, V>),
@@ -192,9 +191,11 @@ impl<K: Ord, V> BTree<K, V> {
             Node::INode(..) => false
         }
     }
+}
 
+impl<K: Ord, V> KVStore<K, V> for BTree<K, V> {
     /// Fetches the value associated with the key in the tree, if it exists.
-    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    fn get<Q>(&self, key: &Q) -> Option<&V>
         where K: Borrow<Q>,
               Q: Ord + ?Sized
     {
@@ -203,7 +204,7 @@ impl<K: Ord, V> BTree<K, V> {
 
     /// Inserts a key value pair into the tree. If the key already exists,
     /// updates the value mapped to the key.
-    pub fn put(&mut self, key: K, value: V) {
+    fn put(&mut self, key: K, value: V) {
         let result = self.root.put(key, value, self.degree);
         let PutResult::Split {promoted_kv, right_sibling} = result else { return };
         // Replace with dummy value.
@@ -215,7 +216,7 @@ impl<K: Ord, V> BTree<K, V> {
         self.root = new_root;
     }
 
-    pub fn iter(&self) -> BTreeIter<'_, K, V> {
+    fn iter(&self) -> BTreeIter<'_, K, V> {
         BTreeIter::new(self)
     }
 }
@@ -297,9 +298,7 @@ impl <'a, K: Ord, V> Iterator for BTreeIter<'a, K, V> {
     }
 }
 
-impl <'a, K: Ord, V> MapIterator<'a, K> for BTreeIter<'a, K, V> {
-    type Item = (&'a K, &'a V);
-
+impl <'a, K: Ord, V> SeekableIterator<K> for BTreeIter<'a, K, V> {
     fn seek<Q>(&mut self, key: &Q) -> Option<Self::Item>
         where K: Borrow<Q>,
               Q: Ord + ?Sized
