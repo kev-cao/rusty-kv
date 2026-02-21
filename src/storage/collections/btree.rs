@@ -1,4 +1,4 @@
-use super::{KVStore, SeekableIterator};
+use super::{IntoSeekableIterator, KVStore, SeekableIterator};
 use std::borrow::Borrow;
 use std::iter::{IntoIterator, Iterator};
 use std::mem;
@@ -233,7 +233,11 @@ impl<K: Ord, V> KVStore<K, V> for BTree<K, V> {
         self.root = new_root;
     }
 
-    fn iter(&self) -> BTreeIter<'_, K, V> {
+    fn iter<'a>(&'a self) -> impl SeekableIterator<K, Item = (&'a K, &'a V)>
+    where
+        K: 'a,
+        V: 'a,
+    {
         BTreeIter::new(self)
     }
 }
@@ -245,6 +249,10 @@ impl<K: Ord, V> IntoIterator for BTree<K, V> {
     fn into_iter(self) -> Self::IntoIter {
         OwnedBTreeIter::new(self)
     }
+}
+
+impl<K: Ord, V> IntoSeekableIterator<K> for BTree<K, V> {
+    type IntoIter = OwnedBTreeIter<K, V>;
 }
 
 enum IterFrame<'a, K: Ord, V> {
@@ -451,11 +459,21 @@ impl<K: Ord, V> Iterator for OwnedBTreeIter<K, V> {
     }
 }
 
+impl<K: Ord, V> SeekableIterator<K> for OwnedBTreeIter<K, V> {
+    fn seek<Q>(&mut self, _: &Q) -> Option<Self::Item>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::seq::SliceRandom;
-    use rand::{rng, Rng};
+    use rand::{Rng, rng};
 
     #[test]
     fn put_get_roundtrip() {
@@ -515,8 +533,8 @@ mod tests {
                 let Some((k, v)) = next else {
                     panic!("expected Some({}) from iter, received None", x)
                 };
-                assert_eq!(x, *k);
-                assert_eq!(x, *v);
+                assert_eq!(*k, x);
+                assert_eq!(*v, x);
             }
         }
     }
@@ -559,8 +577,8 @@ mod tests {
                 let Some((k, v)) = next else {
                     panic!("expected Some({}) from iter, received None", x)
                 };
-                assert_eq!(x, k);
-                assert_eq!(x, v);
+                assert_eq!(k, x);
+                assert_eq!(v, x);
             }
         }
     }
@@ -612,31 +630,31 @@ mod tests {
             let Some((k, v)) = next else {
                 panic!("expected Some({}) from iter, received None", start_odd)
             };
-            assert_eq!(start_odd, *k);
-            assert_eq!(start_odd, *v);
+            assert_eq!(*k, start_odd);
+            assert_eq!(*v, start_odd);
 
             for x in (start_odd + 2..=NUM_VALUES * 2).step_by(2) {
                 let next = it.next();
                 let Some((k, v)) = next else {
                     panic!("expected Some({}) from iter, received None", x)
                 };
-                assert_eq!(x, *k);
-                assert_eq!(x, *v);
+                assert_eq!(*k, x);
+                assert_eq!(*v, x);
             }
 
             let next = it.seek(&start_even);
             let Some((k, v)) = next else {
                 panic!("expected Some({}) from iter, received None", start_odd)
             };
-            assert_eq!(start_even + 1, *k);
-            assert_eq!(start_even + 1, *v);
+            assert_eq!(*k, start_even + 1);
+            assert_eq!(*v, start_even + 1);
             for x in (start_even + 3..=NUM_VALUES * 2).step_by(2) {
                 let next = it.next();
                 let Some((k, v)) = next else {
                     panic!("expected Some({}) from iter, received None", x)
                 };
-                assert_eq!(x, *k);
-                assert_eq!(x, *v);
+                assert_eq!(*k, x);
+                assert_eq!(*v, x);
             }
         }
     }
