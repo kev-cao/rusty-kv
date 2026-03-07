@@ -10,7 +10,10 @@ pub trait KVStore<K: Ord, V>: IntoSeekableIterator<K> {
         K: Borrow<Q>,
         Q: Ord + ?Sized;
 
-    fn iter<'a>(&'a self) -> impl SeekableIterator<K>;
+    fn iter<'a>(&'a self) -> impl SeekableIterator<K, Item = (&'a K, &'a V)>
+    where
+        K: 'a,
+        V: 'a;
 }
 
 pub trait IntoSeekableIterator<K: Ord>: IntoIterator {
