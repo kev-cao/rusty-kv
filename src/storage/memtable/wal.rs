@@ -71,47 +71,8 @@ impl Wal for FileWal {
     }
 
     fn recover(path: impl AsRef<path::Path>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WalError> {
-        let file = fs::File::open(path)?;
-        let mut reader = io::BufReader::new(file);
-        let mut kvs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-        let mut key_lenb = [0u8; mem::size_of::<KeyLen>()];
-        let mut val_lenb = [0u8; mem::size_of::<ValueLen>()];
-        loop {
-            // Running into EOF at the top of the loop means we have read all
-            // KVs stored in the WAL. An EOF at any other time implies
-            // corruption of the WAL.
-            if let Err(e) = reader.read_exact(&mut key_lenb) {
-                if e.kind() == io::ErrorKind::UnexpectedEof {
-                    break;
-                }
-                return Err(e.into());
-            }
-            let key_len = KeyLen::from_le_bytes(key_lenb);
-            let mut key = vec![0; key_len as usize];
-            reader.read_exact(&mut key)?;
-
-            reader.read_exact(&mut val_lenb)?;
-            let val_len = ValueLen::from_le_bytes(val_lenb);
-            let mut value = vec![0; val_len as usize];
-            reader.read_exact(&mut value)?;
-
-            let checksum = {
-                let mut hasher = Hasher::new();
-                hasher.update(&key_lenb);
-                hasher.update(&key);
-                hasher.update(&val_lenb);
-                hasher.update(&value);
-                hasher.finalize().to_le_bytes()
-            };
-            let mut stored_checksum = [0; 4];
-            reader.read_exact(&mut stored_checksum)?;
-            if stored_checksum != checksum {
-                return Err(WalError::InvalidChecksum);
-            }
-            kvs.push((key, value));
-        }
-        Ok(kvs)
+        let mut file = fs::File::open(path)?;
+        read_kvs(file)
     }
 
     fn delete(path: impl AsRef<path::Path>) -> Result<(), WalError> {
@@ -120,42 +81,11 @@ impl Wal for FileWal {
     }
 
     fn append(&mut self, key: &[u8], value: &[u8]) -> Result<(), WalError> {
-        if key.len() > KeyLen::MAX as usize {
-            return Err(WalError::KVLengthExceeded {
-                actual: key.len(),
-                max: KeyLen::MAX as usize,
-            });
-        }
-        if value.len() > ValueLen::MAX as usize {
-            return Err(WalError::KVLengthExceeded {
-                actual: value.len(),
-                max: ValueLen::MAX as usize,
-            });
-        }
-
-        let key_len = (key.len() as KeyLen).to_le_bytes();
-        self.file.write_all(&key_len)?;
-        self.file.write_all(key)?;
-
-        let val_len = (value.len() as ValueLen).to_le_bytes();
-        self.file.write_all(&val_len)?;
-        self.file.write_all(value)?;
-
-        let checksum = {
-            let mut hasher = Hasher::new();
-            hasher.update(&key_len);
-            hasher.update(key);
-            hasher.update(&val_len);
-            hasher.update(value);
-            hasher.finalize().to_le_bytes()
-        };
-
-        self.file.write_all(&checksum)?;
+        write_kv(&mut self.file, key, value)?;
         self.file.flush()?;
         if self.mode == SyncMode::Sync {
             self.sync()?;
         }
-
         Ok(())
     }
 
@@ -169,6 +99,86 @@ impl Wal for FileWal {
         self.sync()?;
         Ok(self.path)
     }
+}
+
+/// Writes a key-value pair to the provided WAL sink.
+fn write_kv(sink: &mut impl Write, key: &[u8], value: &[u8]) -> Result<(), WalError> {
+    if key.len() > KeyLen::MAX as usize {
+        return Err(WalError::KVLengthExceeded {
+            actual: key.len(),
+            max: KeyLen::MAX as usize,
+        });
+    }
+    if value.len() > ValueLen::MAX as usize {
+        return Err(WalError::KVLengthExceeded {
+            actual: value.len(),
+            max: ValueLen::MAX as usize,
+        });
+    }
+
+    let key_len = (key.len() as KeyLen).to_le_bytes();
+    sink.write_all(&key_len)?;
+    sink.write_all(key)?;
+
+    let val_len = (value.len() as ValueLen).to_le_bytes();
+    sink.write_all(&val_len)?;
+    sink.write_all(value)?;
+
+    let checksum = {
+        let mut hasher = Hasher::new();
+        hasher.update(&key_len);
+        hasher.update(key);
+        hasher.update(&val_len);
+        hasher.update(value);
+        hasher.finalize().to_le_bytes()
+    };
+
+    sink.write_all(&checksum)?;
+    Ok(())
+}
+
+/// Reads all key-value pairs from the provided WAL source.
+fn read_kvs(source: impl Read) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WalError> {
+    let mut reader = io::BufReader::new(source);
+    let mut kvs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    let mut key_lenb = [0u8; mem::size_of::<KeyLen>()];
+    let mut val_lenb = [0u8; mem::size_of::<ValueLen>()];
+    loop {
+        // Running into EOF at the top of the loop means we have read all
+        // KVs stored in the WAL. An EOF at any other time implies
+        // corruption of the WAL.
+        if let Err(e) = reader.read_exact(&mut key_lenb) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                break;
+            }
+            return Err(e.into());
+        }
+        let key_len = KeyLen::from_le_bytes(key_lenb);
+        let mut key = vec![0; key_len as usize];
+        reader.read_exact(&mut key)?;
+
+        reader.read_exact(&mut val_lenb)?;
+        let val_len = ValueLen::from_le_bytes(val_lenb);
+        let mut value = vec![0; val_len as usize];
+        reader.read_exact(&mut value)?;
+
+        let checksum = {
+            let mut hasher = Hasher::new();
+            hasher.update(&key_lenb);
+            hasher.update(&key);
+            hasher.update(&val_lenb);
+            hasher.update(&value);
+            hasher.finalize().to_le_bytes()
+        };
+        let mut stored_checksum = [0; 4];
+        reader.read_exact(&mut stored_checksum)?;
+        if stored_checksum != checksum {
+            return Err(WalError::InvalidChecksum);
+        }
+        kvs.push((key, value));
+    }
+    Ok(kvs)
 }
 
 #[cfg(test)]
