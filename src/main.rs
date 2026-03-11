@@ -3,13 +3,13 @@ mod storage;
 use std::collections::BTreeMap;
 
 struct KvStore {
-    store: BTreeMap<Vec<u8>, Vec<u8>>
+    store: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 impl KvStore {
     pub fn new() -> Self {
         KvStore {
-            store: BTreeMap::new()
+            store: BTreeMap::new(),
         }
     }
 

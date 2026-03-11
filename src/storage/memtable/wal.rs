@@ -8,6 +8,7 @@ use std::{
 
 type KeyLen = u16;
 type ValueLen = u32;
+type KVs = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum WalError {
@@ -26,28 +27,11 @@ pub enum SyncMode {
 }
 
 pub trait Wal {
-    /// Opens an existing WAL file or creates a new one if it doesn't exist.
-    fn open(path: impl AsRef<path::Path>, mode: SyncMode) -> Result<Self, WalError>
-    where
-        Self: Sized;
-    /// Recovers all key-value pairs from the WAL file in the order in which
-    /// they were appended.
-    fn recover(path: impl AsRef<path::Path>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WalError>;
-    /// Deletes the WAL file from disk. This is typically called after a
-    /// successful flush of the memtable to disk, as the WAL is no longer needed
-    /// once its contents have been safely persisted.
-    fn delete(path: impl AsRef<path::Path>) -> Result<(), WalError>;
-
     /// Appends a key-value pair to the WAL.
     fn append(&mut self, key: &[u8], value: &[u8]) -> Result<(), WalError>;
     /// Synchronously forces the OS to flush all cached data to the physical
     /// disk, ensuring durability. Only meaningful in Async mode.
     fn sync(&mut self) -> Result<(), WalError>;
-    /// Closes the current WAL and returns its path for later deletion. After
-    /// calling this, the WAL can no longer accept writes.
-    fn close(self) -> Result<PathBuf, WalError>
-    where
-        Self: Sized;
 }
 
 pub struct FileWal {
@@ -56,8 +40,9 @@ pub struct FileWal {
     mode: SyncMode,
 }
 
-impl Wal for FileWal {
-    fn open(path: impl AsRef<path::Path>, mode: SyncMode) -> Result<Self, WalError> {
+impl FileWal {
+    /// Opens an existing WAL file or creates a new one if it doesn't exist.
+    pub fn open(path: impl AsRef<path::Path>, mode: SyncMode) -> Result<Self, WalError> {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             file: io::BufWriter::new(
@@ -70,16 +55,30 @@ impl Wal for FileWal {
         })
     }
 
-    fn recover(path: impl AsRef<path::Path>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WalError> {
-        let mut file = fs::File::open(path)?;
+    /// Recovers all key-value pairs from the WAL file in the order in which
+    /// they were appended.
+    pub fn recover(path: impl AsRef<path::Path>) -> Result<KVs, WalError> {
+        let file = fs::File::open(path)?;
         read_kvs(file)
     }
 
-    fn delete(path: impl AsRef<path::Path>) -> Result<(), WalError> {
+    /// Deletes the WAL file from disk. This is typically called after a
+    /// successful flush of the memtable to disk, as the WAL is no longer needed
+    /// once its contents have been safely persisted.
+    pub fn delete(path: impl AsRef<path::Path>) -> Result<(), WalError> {
         fs::remove_file(path)?;
         Ok(())
     }
 
+    /// Closes the current WAL and returns its path for later deletion. After
+    /// calling this, the WAL can no longer accept writes.
+    pub fn close(mut self) -> Result<PathBuf, WalError> {
+        self.sync()?;
+        Ok(self.path)
+    }
+}
+
+impl Wal for FileWal {
     fn append(&mut self, key: &[u8], value: &[u8]) -> Result<(), WalError> {
         write_kv(&mut self.file, key, value)?;
         self.file.flush()?;
@@ -94,10 +93,33 @@ impl Wal for FileWal {
         self.file.get_ref().sync_all()?;
         Ok(())
     }
+}
 
-    fn close(mut self) -> Result<PathBuf, WalError> {
-        self.sync()?;
-        Ok(self.path)
+pub struct MemWal {
+    bytes: Vec<u8>,
+}
+
+impl MemWal {
+    /// Creates a new in-memory WAL instance. This is primarily intended for
+    /// testing.
+    pub fn open() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    /// Recovers all key-value pairs from the in-memory WAL in the order in
+    /// which they were appended.
+    pub fn recover(bytes: &[u8]) -> Result<KVs, WalError> {
+        read_kvs(bytes)
+    }
+}
+
+impl Wal for MemWal {
+    fn append(&mut self, key: &[u8], value: &[u8]) -> Result<(), WalError> {
+        write_kv(&mut self.bytes, key, value)
+    }
+
+    fn sync(&mut self) -> Result<(), WalError> {
+        Ok(())
     }
 }
 
@@ -138,7 +160,7 @@ fn write_kv(sink: &mut impl Write, key: &[u8], value: &[u8]) -> Result<(), WalEr
 }
 
 /// Reads all key-value pairs from the provided WAL source.
-fn read_kvs(source: impl Read) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WalError> {
+fn read_kvs(source: impl Read) -> Result<KVs, WalError> {
     let mut reader = io::BufReader::new(source);
     let mut kvs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
@@ -187,7 +209,11 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use rand::{rng, seq::IndexedRandom};
+    use std::mem;
     use tempfile::NamedTempFile;
+
+    const MAX_TEST_KEY_LEN: usize = u16::MAX as usize;
+    const MAX_TEST_VAL_LEN: usize = u16::MAX as usize;
 
     #[test]
     fn wal_roundtrip() {
@@ -203,9 +229,6 @@ mod tests {
 
         let tmp = NamedTempFile::new().expect("failed to create temp file");
         let mut wal = FileWal::open(tmp.path(), mode).expect("failed to open WAL");
-
-        const MAX_TEST_KEY_LEN: usize = u16::MAX as usize;
-        const MAX_TEST_VAL_LEN: usize = u16::MAX as usize;
 
         let mut appended: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for _ in 0..100 {
@@ -231,6 +254,74 @@ mod tests {
             "recovered KVs did not match appended KVs"
         );
         FileWal::delete(&path).expect("failed to delete WAL");
+    }
+
+    #[test]
+    fn corrupted_key_len() {
+        let mut wal = MemWal::open();
+        wal.append(b"key", b"value")
+            .expect("failed to write KV to WAL");
+
+        wal.bytes[0..mem::size_of::<KeyLen>()].copy_from_slice(&12u16.to_le_bytes());
+
+        MemWal::recover(&wal.bytes)
+            .expect_err("expected recovery to fail due to corrupted key length");
+    }
+
+    #[test]
+    fn corrupted_key_bytes() {
+        let mut wal = MemWal::open();
+        let key: &[u8] = b"key";
+        let value: &[u8] = b"value";
+        wal.append(key, value).expect("failed to write KV to WAL");
+
+        let idx_bytes = mem::size_of::<KeyLen>();
+        wal.bytes[idx_bytes..idx_bytes + key.len()].copy_from_slice(b"kay");
+
+        MemWal::recover(&wal.bytes)
+            .expect_err("expected recovery to fail due to corrupted key bytes");
+    }
+
+    #[test]
+    fn corrupted_value_len() {
+        let mut wal = MemWal::open();
+        let key: &[u8] = b"key";
+        let value: &[u8] = b"value";
+        wal.append(key, value).expect("failed to write KV to WAL");
+
+        let val_idx = mem::size_of::<KeyLen>() + key.len();
+        wal.bytes[val_idx..val_idx + mem::size_of::<ValueLen>()]
+            .copy_from_slice(&2u32.to_le_bytes());
+
+        MemWal::recover(&wal.bytes)
+            .expect_err("expected recovery to fail due to corrupted value length");
+    }
+
+    #[test]
+    fn corrupted_value_bytes() {
+        let mut wal = MemWal::open();
+        let key: &[u8] = b"key";
+        let value: &[u8] = b"value";
+        wal.append(key, value).expect("failed to write KV to WAL");
+
+        let val_idx = mem::size_of::<KeyLen>() + key.len() + mem::size_of::<ValueLen>();
+        wal.bytes[val_idx..val_idx + value.len()].copy_from_slice(b"valye");
+
+        MemWal::recover(&wal.bytes)
+            .expect_err("expected recovery to fail due to corrupted value bytes");
+    }
+
+    #[test]
+    fn corrupted_checksum() {
+        let mut wal = MemWal::open();
+        wal.append(b"key", b"value")
+            .expect("failed to write KV to WAL");
+
+        let bytes_len = wal.bytes.len();
+        wal.bytes[bytes_len - 1] ^= 0xFF;
+
+        MemWal::recover(&wal.bytes)
+            .expect_err("expected recovery to fail due to corrupted checksum");
     }
 
     fn generate_rand_bytes(n: usize, mut rng: impl Rng) -> Vec<u8> {
