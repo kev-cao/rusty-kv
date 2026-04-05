@@ -12,6 +12,10 @@ thiserror = "2.0.18"
 criterion = "0.8.2"
 tempfile = "3.26.0"
 
+[features]
+__internal_whitebox = []
+
 [[bench]]
 name = "wal_bench"
 harness = false
+required-features = ["__internal_whitebox"]

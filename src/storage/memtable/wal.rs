@@ -26,7 +26,7 @@ pub enum SyncMode {
     Async,
 }
 
-pub(crate) trait Wal {
+pub trait Wal {
     /// Appends a key-value pair to the WAL.
     fn append(&mut self, key: &[u8], value: &[u8]) -> Result<(), WalError>;
     /// Synchronously forces the OS to flush all cached data to the physical
@@ -34,7 +34,7 @@ pub(crate) trait Wal {
     fn sync(&mut self) -> Result<(), WalError>;
 }
 
-pub(crate) struct FileWal {
+pub struct FileWal {
     path: PathBuf,
     file: io::BufWriter<fs::File>,
     mode: SyncMode,
@@ -101,7 +101,7 @@ impl Wal for FileWal {
     }
 }
 
-pub(crate) struct MemWal {
+pub struct MemWal {
     bytes: Vec<u8>,
 }
 

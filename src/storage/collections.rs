@@ -1,6 +1,6 @@
 use std::borrow::Borrow;
 
-pub mod btree;
+pub(super) mod btree;
 
 pub trait KVStore<K: Ord, V>: IntoIterator {
     fn put(&mut self, key: K, value: V);

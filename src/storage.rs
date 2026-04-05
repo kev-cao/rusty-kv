@@ -1,2 +1,2 @@
-pub(crate) mod collections;
-pub mod memtable;
+mod collections;
+pub(crate) mod memtable;

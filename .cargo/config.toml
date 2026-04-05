@@ -1,0 +1,5 @@
+[build]
+rustflags = []
+
+[rust-analyzer]
+cargo.features = ["__internal_whitebox"]

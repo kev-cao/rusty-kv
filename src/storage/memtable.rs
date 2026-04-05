@@ -1,4 +1,4 @@
-pub mod wal;
+pub(crate) mod wal;
 
 use std::borrow::Borrow;
 use std::path::Path;
@@ -12,7 +12,7 @@ pub enum MemTableError {
     WalOpError(#[from] wal::WalError),
 }
 
-struct MemTableImpl<W: Wal> {
+pub struct MemTableImpl<W: Wal> {
     id: u64,
     btree: BTree<Vec<u8>, Vec<u8>>,
     wal: W,
@@ -56,8 +56,8 @@ impl<W: Wal> MemTableImpl<W> {
     }
 }
 
-pub(crate) type MemTableProd = MemTableImpl<wal::FileWal>;
-pub(crate) type MemTableDev = MemTableImpl<wal::MemWal>;
+pub type MemTableProd = MemTableImpl<wal::FileWal>;
+pub type MemTableDev = MemTableImpl<wal::MemWal>;
 
 impl MemTableImpl<wal::FileWal> {
     /// Creates a new MemTable with a given ID and size threshold. The WAL is
