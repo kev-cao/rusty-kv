@@ -19,7 +19,7 @@ fn wal_benchmark(c: &mut Criterion) {
                 // temporary file in the current directory, which is likely on
                 // disk, to get more realistic performance measurements.
                 let tmp = NamedTempFile::new_in(".").expect("failed to create temp file");
-                let mut wal = FileWal::create(tmp.path(), mode).expect("failed to create WAL");
+                let mut wal = FileWal::new(tmp.path(), mode).expect("failed to create WAL");
 
                 // Simple constant data
                 let key = vec![0u8; MAX_TEST_KEY_LEN];

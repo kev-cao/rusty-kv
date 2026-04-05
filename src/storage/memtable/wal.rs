@@ -26,7 +26,7 @@ pub enum SyncMode {
     Async,
 }
 
-pub trait Wal {
+pub(crate) trait Wal {
     /// Appends a key-value pair to the WAL.
     fn append(&mut self, key: &[u8], value: &[u8]) -> Result<(), WalError>;
     /// Synchronously forces the OS to flush all cached data to the physical
@@ -34,7 +34,7 @@ pub trait Wal {
     fn sync(&mut self) -> Result<(), WalError>;
 }
 
-pub struct FileWal {
+pub(crate) struct FileWal {
     path: PathBuf,
     file: io::BufWriter<fs::File>,
     mode: SyncMode,
@@ -43,7 +43,7 @@ pub struct FileWal {
 impl FileWal {
     /// Creates a new WAL file at the specified path. This will fail if a file
     /// already exists at that path.
-    pub fn create(path: impl AsRef<path::Path>, mode: SyncMode) -> Result<Self, WalError> {
+    pub fn new(path: impl AsRef<path::Path>, mode: SyncMode) -> Result<Self, WalError> {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             file: io::BufWriter::new(fs::OpenOptions::new().create_new(true).open(path)?),
@@ -101,14 +101,14 @@ impl Wal for FileWal {
     }
 }
 
-pub struct MemWal {
+pub(crate) struct MemWal {
     bytes: Vec<u8>,
 }
 
 impl MemWal {
     /// Creates a new in-memory WAL instance. This is primarily intended for
     /// testing.
-    pub fn create() -> Self {
+    pub fn new() -> Self {
         Self { bytes: Vec::new() }
     }
 
@@ -232,7 +232,7 @@ mod tests {
         println!("using sync mode {:?}", mode);
 
         let tmp = NamedTempFile::new().expect("failed to create temp file");
-        let mut wal = FileWal::create(tmp.path(), mode).expect("failed to create WAL");
+        let mut wal = FileWal::new(tmp.path(), mode).expect("failed to create WAL");
 
         let mut appended: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for _ in 0..100 {
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn corrupted_key_len() {
-        let mut wal = MemWal::create();
+        let mut wal = MemWal::new();
         wal.append(b"key", b"value")
             .expect("failed to write KV to WAL");
 
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn corrupted_key_bytes() {
-        let mut wal = MemWal::create();
+        let mut wal = MemWal::new();
         let key: &[u8] = b"key";
         let value: &[u8] = b"value";
         wal.append(key, value).expect("failed to write KV to WAL");
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn corrupted_value_len() {
-        let mut wal = MemWal::create();
+        let mut wal = MemWal::new();
         let key: &[u8] = b"key";
         let value: &[u8] = b"value";
         wal.append(key, value).expect("failed to write KV to WAL");
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn corrupted_value_bytes() {
-        let mut wal = MemWal::create();
+        let mut wal = MemWal::new();
         let key: &[u8] = b"key";
         let value: &[u8] = b"value";
         wal.append(key, value).expect("failed to write KV to WAL");
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn corrupted_checksum() {
-        let mut wal = MemWal::create();
+        let mut wal = MemWal::new();
         wal.append(b"key", b"value")
             .expect("failed to write KV to WAL");
 
