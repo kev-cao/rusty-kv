@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod macros;
 pub mod storage;
 
 use std::collections::BTreeMap;

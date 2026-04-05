@@ -212,9 +212,9 @@ fn read_kvs(source: impl Read) -> Result<KVs, WalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
-    use rand::{rng, seq::IndexedRandom};
+    use crate::macros::seeded_rng;
+    use rand::Rng;
+    use rand::seq::IndexedRandom;
     use std::mem;
     use tempfile::NamedTempFile;
 
@@ -223,9 +223,7 @@ mod tests {
 
     #[test]
     fn wal_roundtrip() {
-        let seed: u64 = rng().random();
-        println!("using seed {}", seed);
-        let mut seeded_rng = StdRng::seed_from_u64(seed);
+        let (mut seeded_rng, _) = seeded_rng!();
 
         const SYNC_MODES: [SyncMode; 2] = [SyncMode::Sync, SyncMode::Async];
         let mode = *SYNC_MODES
