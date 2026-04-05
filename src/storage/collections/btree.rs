@@ -1,4 +1,4 @@
-use super::{IntoSeekableIterator, KVStore, SeekableIterator};
+use super::{KVStore, SeekableIterator};
 use std::borrow::Borrow;
 use std::iter::{IntoIterator, Iterator};
 use std::mem;
@@ -251,10 +251,6 @@ impl<K: Ord, V> IntoIterator for BTree<K, V> {
     }
 }
 
-impl<K: Ord, V> IntoSeekableIterator<K> for BTree<K, V> {
-    type IntoIter = OwnedBTreeIter<K, V>;
-}
-
 enum IterFrame<'a, K: Ord, V> {
     LNode(&'a LNode<K, V>, usize),
     INode(&'a INode<K, V>, usize),
@@ -456,16 +452,6 @@ impl<K: Ord, V> Iterator for OwnedBTreeIter<K, V> {
                 }
             };
         }
-    }
-}
-
-impl<K: Ord, V> SeekableIterator<K> for OwnedBTreeIter<K, V> {
-    fn seek<Q>(&mut self, _: &Q) -> Option<Self::Item>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        todo!()
     }
 }
 

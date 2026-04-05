@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 
 pub mod btree;
 
-pub trait KVStore<K: Ord, V>: IntoSeekableIterator<K> {
+pub trait KVStore<K: Ord, V>: IntoIterator {
     fn put(&mut self, key: K, value: V);
 
     fn get<Q>(&self, key: &Q) -> Option<&V>
@@ -14,10 +14,6 @@ pub trait KVStore<K: Ord, V>: IntoSeekableIterator<K> {
     where
         K: 'a,
         V: 'a;
-}
-
-pub trait IntoSeekableIterator<K: Ord>: IntoIterator {
-    type IntoIter: SeekableIterator<K>;
 }
 
 pub trait SeekableIterator<K: Ord>: Iterator {
