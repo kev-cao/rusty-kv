@@ -112,9 +112,12 @@ impl MemTableImpl<wal::MemWal> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::format;
+
     use super::*;
     use crate::macros::seeded_rng;
     use rand::Rng;
+    use tempfile::tempdir;
 
     const MAX_TEST_KEY_LEN: usize = u16::MAX as usize;
     const MAX_TEST_VAL_LEN: usize = u16::MAX as usize;
@@ -183,6 +186,48 @@ mod tests {
             memtable.is_full(),
             "memtable should be full after put with size equal to or greater than max_size",
         )
+    }
+
+    #[test]
+    fn recover() {
+        let tmp = tempdir().expect("failed to create temp dir");
+        let mut memtable =
+            MemTableProd::new(0, tmp.path(), 1024).expect("failed to create file-backed memtable");
+
+        for i in 0..100 {
+            let key = format!("key{:02}", i).into_bytes();
+            let value = format!("value{:02}", i).into_bytes();
+            memtable
+                .put(key, value)
+                .expect("failed to put into memtable");
+        }
+
+        memtable.sync().expect("failed to sync memtable");
+
+        let recovered =
+            MemTableProd::recover(0, tmp.path(), 1024).expect("failed to recover memtable");
+
+        let mut recovered_iter = recovered.iter();
+
+        for i in 0..100 {
+            let expected_key = format!("key{:02}", i).into_bytes();
+            let expected_value = format!("value{:02}", i).into_bytes();
+
+            let (k, v) = recovered_iter
+                .next()
+                .expect("recovered memtable should have expected number of entries");
+
+            assert_eq!(
+                k, &expected_key,
+                "recovered memtable did not return expected key @ index {}",
+                i
+            );
+            assert_eq!(
+                v, &expected_value,
+                "recovered memtable did not return expected value @ index {}",
+                i
+            )
+        }
     }
 
     fn generate_rand_bytes(n: usize, mut rng: impl Rng) -> Vec<u8> {

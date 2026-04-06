@@ -46,7 +46,12 @@ impl FileWal {
     pub fn new(path: impl AsRef<path::Path>, mode: SyncMode) -> Result<Self, WalError> {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
-            file: io::BufWriter::new(fs::OpenOptions::new().create_new(true).open(path)?),
+            file: io::BufWriter::new(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?,
+            ),
             mode,
         })
     }
