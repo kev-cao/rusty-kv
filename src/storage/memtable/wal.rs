@@ -13,11 +13,11 @@ type KVs = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum WalError {
-    #[error("WAL file operation failed")]
-    FileOpError(#[from] io::Error),
+    #[error("WAL io operation failed")]
+    IOError(#[from] io::Error),
     #[error(transparent)]
     CodecError(#[from] encoding::CodecError),
-    #[error("Invalid checksum detected")]
+    #[error("invalid checksum detected")]
     InvalidChecksum,
 }
 
