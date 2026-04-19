@@ -200,7 +200,7 @@ fn read_kvs(source: impl Read) -> Result<KVs, WalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macros::seeded_rng;
+    use crate::testutils::seeded_rng;
     use rand::Rng;
     use rand::seq::IndexedRandom;
     use std::mem;
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn wal_roundtrip() {
-        let (mut seeded_rng, _) = seeded_rng!();
+        let (mut seeded_rng, _) = seeded_rng(None);
 
         const SYNC_MODES: [SyncMode; 2] = [SyncMode::Sync, SyncMode::Async];
         let mode = *SYNC_MODES

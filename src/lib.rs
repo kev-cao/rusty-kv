@@ -1,6 +1,6 @@
-#[cfg(test)]
-mod macros;
 mod storage;
+#[cfg(test)]
+mod testutils;
 
 #[cfg(feature = "__internal_whitebox")]
 pub use storage::memtable::wal::{FileWal, SyncMode, Wal};

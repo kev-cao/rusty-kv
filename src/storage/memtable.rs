@@ -33,11 +33,8 @@ impl<W: Wal> MemTableImpl<W> {
     }
 
     /// Retrieves a value from the BTree.
-    pub fn get<K>(&self, key: K) -> Option<&[u8]>
-    where
-        K: Borrow<[u8]>,
-    {
-        self.btree.get(key.borrow()).map(|v| v.as_slice())
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        self.btree.get(key).map(|v| v.as_slice())
     }
 
     /// Returns an iterator over the contents of the MemTable.
@@ -115,7 +112,7 @@ mod tests {
     use std::fmt::format;
 
     use super::*;
-    use crate::macros::seeded_rng;
+    use crate::testutils::seeded_rng;
     use rand::Rng;
     use tempfile::tempdir;
 
@@ -124,7 +121,7 @@ mod tests {
 
     #[test]
     fn put_get_roundtrip() {
-        let (mut rng, _) = seeded_rng!();
+        let (mut rng, _) = seeded_rng(None);
         let mut memtable = MemTableDev::new(1024);
 
         let mut appended: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -143,7 +140,7 @@ mod tests {
         for (k, v) in &appended {
             assert_eq!(
                 memtable
-                    .get(k.as_slice())
+                    .get(k)
                     .expect("failed to get known key in memtable"),
                 v,
                 "memtable.get did not match expected value"
