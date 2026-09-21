@@ -1,24 +1,26 @@
 use std::borrow::Borrow;
+use std::fmt::Debug;
 
 pub(super) mod btree;
 
-pub trait KVStore<K: Ord, V>: IntoIterator {
-    fn put(&mut self, key: K, value: V);
+pub trait KVIterator {
+    type Key: Ord;
+    type Value;
+    type Error: Debug;
 
-    fn get<Q>(&self, key: &Q) -> Option<&V>
+    fn key(&self) -> Result<Option<&Self::Key>, Self::Error>;
+
+    fn value(&self) -> Result<Option<&Self::Value>, Self::Error>;
+
+    fn next(&mut self) -> Result<bool, Self::Error>;
+
+    fn seek_ge<Q>(&mut self, key: &Q) -> Result<bool, Self::Error>
     where
-        K: Borrow<Q>,
+        Self::Key: Borrow<Q>,
         Q: Ord + ?Sized;
 
-    fn iter<'a>(&'a self) -> impl SeekableIterator<K, Item = (&'a K, &'a V)>
+    fn seek_lt<Q>(&mut self, key: &Q) -> Result<bool, Self::Error>
     where
-        K: 'a,
-        V: 'a;
-}
-
-pub trait SeekableIterator<K: Ord>: Iterator {
-    fn seek<Q>(&mut self, key: &Q) -> Option<Self::Item>
-    where
-        K: Borrow<Q>,
+        Self::Key: Borrow<Q>,
         Q: Ord + ?Sized;
 }

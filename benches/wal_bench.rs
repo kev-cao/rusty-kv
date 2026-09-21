@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use rusty_kv::{FileWal, SyncMode, Wal};
+use rusty_kv::{FileWal, Key, SyncMode, Value, Wal};
 use std::hint::black_box;
 use tempfile::NamedTempFile;
 
@@ -22,8 +22,8 @@ fn wal_benchmark(c: &mut Criterion) {
                 let mut wal = FileWal::open(tmp.path(), mode).expect("failed to create WAL");
 
                 // Simple constant data
-                let key = vec![0u8; MAX_TEST_KEY_LEN];
-                let value = vec![b'x'; MAX_TEST_VAL_LEN];
+                let key = Key::try_from(vec![0u8; MAX_TEST_KEY_LEN])?;
+                let value = Value::try_from(vec![b'x'; MAX_TEST_VAL_LEN])?;
 
                 b.iter(|| {
                     wal.append(black_box(&key), black_box(&value))

@@ -1,24 +1,25 @@
-use crate::storage::encoding;
+use crate::storage::encoding::Codable;
+use crate::storage::kv::{Key, Value};
 
 use crc32fast::Hasher;
+use snafu::prelude::*;
 use std::{
     fs,
     io::{self, BufRead, Read, Write},
     path::{self, PathBuf},
 };
 
-type KeyLen = u16;
-type ValueLen = u32;
-type KVs = Vec<(Vec<u8>, Vec<u8>)>;
+type KVs = Vec<(Key, Value)>;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(Snafu, Debug)]
 pub enum WalError {
-    #[error("WAL io operation failed")]
-    IOError(#[from] io::Error),
-    #[error(transparent)]
-    CodecError(#[from] encoding::CodecError),
-    #[error("invalid checksum detected")]
-    InvalidChecksum,
+    #[snafu(context(false), display("WAL io operation failed: {source}"))]
+    IoError {
+        source: io::Error,
+        backtrace: snafu::Backtrace,
+    },
+    #[snafu(display("invalid checksum detected"))]
+    InvalidChecksum { backtrace: snafu::Backtrace },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -29,7 +30,7 @@ pub enum SyncMode {
 
 pub trait Wal {
     /// Appends a key-value pair to the WAL.
-    fn append(&mut self, key: &[u8], value: &[u8]) -> Result<(), WalError>;
+    fn append(&mut self, key: &Key, value: &Value) -> Result<(), WalError>;
     /// Synchronously forces the OS to flush all cached data to the physical
     /// disk, ensuring durability. Only meaningful in Async mode.
     fn sync(&mut self) -> Result<(), WalError>;
@@ -39,34 +40,34 @@ pub struct FileWal {
     path: PathBuf,
     file: io::BufWriter<fs::File>,
     mode: SyncMode,
-    encode_buffer: Vec<u8>,
 }
 
 impl FileWal {
-    /// Creates a new WAL file at the specified path. This will fail if a file
-    /// already exists at that path.
-    pub fn new(path: impl AsRef<path::Path>, mode: SyncMode) -> Result<Self, WalError> {
+    /// Creates a new WAL file at the specified filepath. If the file already
+    /// exists, it will be truncated.
+    pub fn new(path: impl Into<path::PathBuf>, mode: SyncMode) -> Result<Self, WalError> {
+        let path = path.into();
         Ok(Self {
-            path: path.as_ref().to_path_buf(),
             file: io::BufWriter::new(
                 fs::OpenOptions::new()
                     .write(true)
-                    .create_new(true)
-                    .open(path)?,
+                    .truncate(true)
+                    .create(true)
+                    .open(&path)?,
             ),
+            path,
             mode,
-            encode_buffer: Vec::new(),
         })
     }
 
     /// Opens an existing WAL file at the specified path for appending. This
     /// will fail if no fle exists at the path.
-    pub fn open(path: impl AsRef<path::Path>, mode: SyncMode) -> Result<Self, WalError> {
+    pub fn open(path: impl Into<path::PathBuf>, mode: SyncMode) -> Result<Self, WalError> {
+        let path = path.into();
         Ok(Self {
-            path: path.as_ref().to_path_buf(),
-            file: io::BufWriter::new(fs::OpenOptions::new().append(true).open(path)?),
+            file: io::BufWriter::new(fs::OpenOptions::new().append(true).open(&path)?),
+            path,
             mode,
-            encode_buffer: Vec::new(),
         })
     }
 
@@ -94,8 +95,8 @@ impl FileWal {
 }
 
 impl Wal for FileWal {
-    fn append(&mut self, key: &[u8], value: &[u8]) -> Result<(), WalError> {
-        write_kv(&mut self.file, &mut self.encode_buffer, key, value)?;
+    fn append(&mut self, key: &Key, value: &Value) -> Result<(), WalError> {
+        write_kv(&mut self.file, key, value)?;
         self.file.flush()?;
         if self.mode == SyncMode::Sync {
             self.sync()?;
@@ -112,17 +113,13 @@ impl Wal for FileWal {
 
 pub struct MemWal {
     bytes: Vec<u8>,
-    encode_buffer: Vec<u8>,
 }
 
 impl MemWal {
     /// Creates a new in-memory WAL instance. This is primarily intended for
     /// testing.
     pub fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            encode_buffer: Vec::new(),
-        }
+        Self { bytes: Vec::new() }
     }
 
     /// Recovers all key-value pairs from the in-memory WAL in the order in
@@ -133,8 +130,8 @@ impl MemWal {
 }
 
 impl Wal for MemWal {
-    fn append(&mut self, key: &[u8], value: &[u8]) -> Result<(), WalError> {
-        write_kv(&mut self.bytes, &mut self.encode_buffer, key, value)
+    fn append(&mut self, key: &Key, value: &Value) -> Result<(), WalError> {
+        write_kv(&mut self.bytes, key, value)
     }
 
     fn sync(&mut self) -> Result<(), WalError> {
@@ -142,32 +139,49 @@ impl Wal for MemWal {
     }
 }
 
+struct HashingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    hasher: Hasher,
+}
+
+impl<'a, W: Write> Write for HashingWriter<'a, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.hasher.update(buf);
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<'a, W: Write> HashingWriter<'a, W> {
+    fn new(writer: &'a mut W, hasher: Hasher) -> Self {
+        Self {
+            inner: writer,
+            hasher,
+        }
+    }
+
+    fn finalize(self) -> io::Result<()> {
+        let checksum = self.hasher.finalize().to_le_bytes();
+        self.inner.write_all(&checksum)
+    }
+}
+
 /// Writes a key-value pair to the provided WAL sink.
-fn write_kv(
-    sink: &mut impl Write,
-    buf: &mut Vec<u8>,
-    key: &[u8],
-    value: &[u8],
-) -> Result<(), WalError> {
-    buf.clear();
-    encoding::encode_key(key, buf)?;
-    encoding::encode_value(value, buf)?;
-    sink.write_all(buf)?;
-
-    let checksum = {
-        let mut hasher = Hasher::new();
-        hasher.update(buf);
-        hasher.finalize().to_le_bytes()
-    };
-
-    sink.write_all(&checksum)?;
+fn write_kv(sink: &mut impl Write, key: &Key, value: &Value) -> Result<(), WalError> {
+    let mut hw = HashingWriter::new(sink, Hasher::new());
+    key.encode(&mut hw)?;
+    value.encode(&mut hw)?;
+    hw.finalize()?;
     Ok(())
 }
 
 /// Reads all key-value pairs from the provided WAL source.
 fn read_kvs(source: impl Read) -> Result<KVs, WalError> {
     let mut reader = io::BufReader::new(source);
-    let mut kvs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut kvs: KVs = Vec::new();
 
     loop {
         // Running into EOF at the top of the loop means we have read all
@@ -176,21 +190,21 @@ fn read_kvs(source: impl Read) -> Result<KVs, WalError> {
         if reader.fill_buf()?.is_empty() {
             break;
         }
-        let key = encoding::decode_key(&mut reader)?;
-        let value = encoding::decode_value(&mut reader)?;
+        let key = Key::decode(&mut reader)?;
+        let value = Value::decode(&mut reader)?;
 
         let checksum = {
             let mut hasher = Hasher::new();
-            hasher.update(&(key.len() as encoding::KeyLen).to_le_bytes());
-            hasher.update(&key);
-            hasher.update(&(value.len() as encoding::ValueLen).to_le_bytes());
-            hasher.update(&value);
+            hasher.update(&key.len().to_le_bytes());
+            hasher.update(key.as_ref());
+            hasher.update(&value.len().to_le_bytes());
+            hasher.update(value.as_ref());
             hasher.finalize().to_le_bytes()
         };
         let mut stored_checksum = [0; 4];
         reader.read_exact(&mut stored_checksum)?;
         if stored_checksum != checksum {
-            return Err(WalError::InvalidChecksum);
+            return InvalidChecksumSnafu.fail();
         }
         kvs.push((key, value));
     }
@@ -200,10 +214,10 @@ fn read_kvs(source: impl Read) -> Result<KVs, WalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutils::seeded_rng;
+    use crate::storage::kv::{KeyLen, ValueLen};
+    use crate::testutils::{generate_rand_bytes, key, seeded_rng, value};
     use rand::Rng;
     use rand::seq::IndexedRandom;
-    use std::mem;
     use tempfile::NamedTempFile;
 
     const MAX_TEST_KEY_LEN: usize = u16::MAX as usize;
@@ -222,12 +236,12 @@ mod tests {
         let tmp = NamedTempFile::new().expect("failed to create temp file");
         let mut wal = FileWal::new(tmp.path(), mode).expect("failed to create WAL");
 
-        let mut appended: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut appended: KVs = Vec::new();
         for _ in 0..100 {
             let key_len = seeded_rng.random_range(0..=MAX_TEST_KEY_LEN);
             let val_len = seeded_rng.random_range(0..=MAX_TEST_VAL_LEN);
-            let key = generate_rand_bytes(key_len, &mut seeded_rng);
-            let value = generate_rand_bytes(val_len, &mut seeded_rng);
+            let key = key(&generate_rand_bytes(key_len, &mut seeded_rng));
+            let value = value(&generate_rand_bytes(val_len, &mut seeded_rng));
 
             wal.append(&key, &value).expect("failed to append to WAL");
             appended.push((key, value));
@@ -251,10 +265,10 @@ mod tests {
     #[test]
     fn corrupted_key_len() {
         let mut wal = MemWal::new();
-        wal.append(b"key", b"value")
+        wal.append(&key(b"key".as_ref()), &value(b"value".as_ref()))
             .expect("failed to write KV to WAL");
 
-        wal.bytes[0..mem::size_of::<KeyLen>()].copy_from_slice(&12u16.to_le_bytes());
+        wal.bytes[0..size_of::<KeyLen>()].copy_from_slice(&12u16.to_le_bytes());
 
         MemWal::recover(&wal.bytes)
             .expect_err("expected recovery to fail due to corrupted key length");
@@ -263,12 +277,12 @@ mod tests {
     #[test]
     fn corrupted_key_bytes() {
         let mut wal = MemWal::new();
-        let key: &[u8] = b"key";
-        let value: &[u8] = b"value";
+        let key: &Key = &key(b"key".as_ref());
+        let value: &Value = &value(b"value".as_ref());
         wal.append(key, value).expect("failed to write KV to WAL");
 
-        let idx_bytes = mem::size_of::<KeyLen>();
-        wal.bytes[idx_bytes..idx_bytes + key.len()].copy_from_slice(b"kay");
+        let idx_bytes = size_of::<KeyLen>();
+        wal.bytes[idx_bytes..idx_bytes + key.len() as usize].copy_from_slice(b"kay");
 
         MemWal::recover(&wal.bytes)
             .expect_err("expected recovery to fail due to corrupted key bytes");
@@ -277,13 +291,12 @@ mod tests {
     #[test]
     fn corrupted_value_len() {
         let mut wal = MemWal::new();
-        let key: &[u8] = b"key";
-        let value: &[u8] = b"value";
+        let key: &Key = &key(b"key".as_ref());
+        let value: &Value = &value(b"value".as_ref());
         wal.append(key, value).expect("failed to write KV to WAL");
 
-        let val_idx = mem::size_of::<KeyLen>() + key.len();
-        wal.bytes[val_idx..val_idx + mem::size_of::<ValueLen>()]
-            .copy_from_slice(&2u32.to_le_bytes());
+        let val_idx = size_of::<KeyLen>() + key.len() as usize;
+        wal.bytes[val_idx..val_idx + size_of::<ValueLen>()].copy_from_slice(&2u32.to_le_bytes());
 
         MemWal::recover(&wal.bytes)
             .expect_err("expected recovery to fail due to corrupted value length");
@@ -292,12 +305,12 @@ mod tests {
     #[test]
     fn corrupted_value_bytes() {
         let mut wal = MemWal::new();
-        let key: &[u8] = b"key";
-        let value: &[u8] = b"value";
+        let key: &Key = &key(b"key".as_ref());
+        let value: &Value = &value(b"value".as_ref());
         wal.append(key, value).expect("failed to write KV to WAL");
 
-        let val_idx = mem::size_of::<KeyLen>() + key.len() + mem::size_of::<ValueLen>();
-        wal.bytes[val_idx..val_idx + value.len()].copy_from_slice(b"valye");
+        let val_idx = size_of::<KeyLen>() + key.len() as usize + size_of::<ValueLen>();
+        wal.bytes[val_idx..val_idx + value.len() as usize].copy_from_slice(b"valye");
 
         MemWal::recover(&wal.bytes)
             .expect_err("expected recovery to fail due to corrupted value bytes");
@@ -306,19 +319,14 @@ mod tests {
     #[test]
     fn corrupted_checksum() {
         let mut wal = MemWal::new();
-        wal.append(b"key", b"value")
-            .expect("failed to write KV to WAL");
+        let key: &Key = &key(b"key".as_ref());
+        let value: &Value = &value(b"value".as_ref());
+        wal.append(key, value).expect("failed to write KV to WAL");
 
         let bytes_len = wal.bytes.len();
         wal.bytes[bytes_len - 1] ^= 0xFF;
 
         MemWal::recover(&wal.bytes)
             .expect_err("expected recovery to fail due to corrupted checksum");
-    }
-
-    fn generate_rand_bytes(n: usize, mut rng: impl Rng) -> Vec<u8> {
-        let mut data = vec![0u8; n];
-        rng.fill_bytes(&mut data[..]);
-        data
     }
 }

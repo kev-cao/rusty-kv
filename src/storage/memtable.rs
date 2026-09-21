@@ -1,20 +1,21 @@
 pub(crate) mod wal;
 
-use std::borrow::Borrow;
+use snafu::prelude::*;
 use std::path::Path;
 use wal::Wal;
 
-use crate::storage::collections::{KVStore, SeekableIterator, btree::BTree};
+use crate::storage::collections::{KVIterator, btree::BTree};
+use crate::storage::kv::{Key, Value};
 
-#[derive(thiserror::Error, Debug)]
+#[derive(Snafu, Debug)]
 pub enum MemTableError {
-    #[error("WAL operation failed")]
-    WalOpError(#[from] wal::WalError),
+    #[snafu(context(false), display("WAL operation failed: {source}"))]
+    WalOpError { source: wal::WalError },
 }
 
 pub struct MemTableImpl<W: Wal> {
     id: u64,
-    btree: BTree<Vec<u8>, Vec<u8>>,
+    btree: BTree<Key, Value>,
     wal: W,
     max_size: usize,
     current_size: usize,
@@ -25,20 +26,24 @@ pub struct MemTableImpl<W: Wal> {
 /// to ensure durability in the event of a crash.
 impl<W: Wal> MemTableImpl<W> {
     /// Inserts a key-value pair.
-    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), MemTableError> {
+    pub fn put(&mut self, key: Key, value: Value) -> Result<(), MemTableError> {
         self.wal.append(&key, &value)?;
-        self.current_size += key.len() + value.len();
+        self.current_size += key.len() as usize + value.len() as usize;
         self.btree.put(key, value);
         Ok(())
     }
 
     /// Retrieves a value from the BTree.
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        self.btree.get(key).map(|v| v.as_slice())
+    pub fn get(&self, key: &Key) -> Option<&Value> {
+        self.btree.get(key).map(|v| v)
+    }
+
+    pub fn kv_iter(&self) -> impl KVIterator<Key = Key, Value = Value> {
+        self.btree.kv_iter()
     }
 
     /// Returns an iterator over the contents of the MemTable.
-    pub fn iter(&self) -> impl SeekableIterator<Vec<u8>, Item = (&Vec<u8>, &Vec<u8>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Key, &Value)> {
         self.btree.iter()
     }
 
@@ -59,13 +64,13 @@ pub type MemTableDev = MemTableImpl<wal::MemWal>;
 impl MemTableImpl<wal::FileWal> {
     /// Creates a new MemTable with a given ID and size threshold. The WAL is
     /// written to the directory specified by path.
-    pub fn new(id: u64, path: &Path, max_size: usize) -> Result<Self, MemTableError> {
-        let wal_path = path.join(format!("memtable_{}.wal", id));
+    pub fn new(id: u64, path: impl AsRef<Path>, max_size: usize) -> Result<Self, MemTableError> {
+        let wal_path = path.as_ref().join(format!("memtable_{}.wal", id));
         Ok(Self {
             id,
             // TODO (kev-cao): Should set up configurations for WAL mode and
             // BTree degree.
-            wal: wal::FileWal::new(&wal_path, wal::SyncMode::Async)?,
+            wal: wal::FileWal::new(wal_path, wal::SyncMode::Async)?,
             btree: BTree::new(16),
             current_size: 0,
             max_size,
@@ -73,20 +78,24 @@ impl MemTableImpl<wal::FileWal> {
     }
 
     /// Recovers a MemTable from an existing WAL file.
-    pub fn recover(id: u64, path: &Path, max_size: usize) -> Result<Self, MemTableError> {
-        let wal_path = path.join(format!("memtable_{}.wal", id));
+    pub fn recover(
+        id: u64,
+        path: impl AsRef<Path>,
+        max_size: usize,
+    ) -> Result<Self, MemTableError> {
+        let wal_path = path.as_ref().join(format!("memtable_{}.wal", id));
         let kvs = wal::FileWal::recover(&wal_path)?;
         // TODO (kev-cao): Configurations for BTree degree.
-        let mut btree: BTree<Vec<u8>, Vec<u8>> = BTree::new(16);
+        let mut btree: BTree<Key, Value> = BTree::new(16);
         let mut size: usize = 0;
         for (k, v) in kvs {
-            size += k.len() + v.len();
+            size += k.len() as usize + v.len() as usize;
             btree.put(k, v);
         }
         Ok(Self {
             id,
             // TODO (kev-cao): Same here.
-            wal: wal::FileWal::open(&wal_path, wal::SyncMode::Async)?,
+            wal: wal::FileWal::open(wal_path, wal::SyncMode::Async)?,
             btree,
             current_size: size,
             max_size,
@@ -109,10 +118,8 @@ impl MemTableImpl<wal::MemWal> {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::format;
-
     use super::*;
-    use crate::testutils::seeded_rng;
+    use crate::testutils::{generate_rand_bytes, key, seeded_rng, value};
     use rand::Rng;
     use tempfile::tempdir;
 
@@ -124,12 +131,12 @@ mod tests {
         let (mut rng, _) = seeded_rng(None);
         let mut memtable = MemTableDev::new(1024);
 
-        let mut appended: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut appended: Vec<(Key, Value)> = Vec::new();
         for _ in 0..100 {
             let key_len = rng.random_range(0..=MAX_TEST_KEY_LEN);
             let val_len = rng.random_range(0..=MAX_TEST_VAL_LEN);
-            let key = generate_rand_bytes(key_len, &mut rng);
-            let value = generate_rand_bytes(val_len, &mut rng);
+            let key = key(&generate_rand_bytes(key_len, &mut rng));
+            let value = value(&generate_rand_bytes(val_len, &mut rng));
 
             appended.push((key.clone(), value.clone()));
             memtable
@@ -167,7 +174,7 @@ mod tests {
         assert!(!memtable.is_full(), "memtable should not be full initially");
 
         memtable
-            .put(b"key".to_vec(), b"value".to_vec())
+            .put(key(b"key".as_ref()), value(b"value".as_ref()))
             .expect("failed to put into memtable");
 
         assert!(
@@ -176,7 +183,7 @@ mod tests {
         );
 
         memtable
-            .put(b"key2".to_vec(), b"value2".to_vec())
+            .put(key(b"key2".as_ref()), value(b"value2".as_ref()))
             .expect("failed to put into memtable");
 
         assert!(
@@ -192,8 +199,8 @@ mod tests {
             MemTableProd::new(0, tmp.path(), 1024).expect("failed to create file-backed memtable");
 
         for i in 0..100 {
-            let key = format!("key{:02}", i).into_bytes();
-            let value = format!("value{:02}", i).into_bytes();
+            let key = key(format!("key{:02}", i).as_ref());
+            let value = value(format!("value{:02}", i).as_ref());
             memtable
                 .put(key, value)
                 .expect("failed to put into memtable");
@@ -207,8 +214,8 @@ mod tests {
         let mut recovered_iter = recovered.iter();
 
         for i in 0..100 {
-            let expected_key = format!("key{:02}", i).into_bytes();
-            let expected_value = format!("value{:02}", i).into_bytes();
+            let expected_key = key(format!("key{:02}", i).as_ref());
+            let expected_value = value(format!("value{:02}", i).as_ref());
 
             let (k, v) = recovered_iter
                 .next()
@@ -225,11 +232,5 @@ mod tests {
                 i
             )
         }
-    }
-
-    fn generate_rand_bytes(n: usize, mut rng: impl Rng) -> Vec<u8> {
-        let mut data = vec![0u8; n];
-        rng.fill_bytes(&mut data[..]);
-        data
     }
 }

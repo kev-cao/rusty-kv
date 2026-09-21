@@ -3,4 +3,7 @@ mod storage;
 mod testutils;
 
 #[cfg(feature = "__internal_whitebox")]
-pub use storage::memtable::wal::{FileWal, SyncMode, Wal};
+pub use storage::{
+    kv::{Key, Value},
+    memtable::wal::{FileWal, SyncMode, Wal},
+};
