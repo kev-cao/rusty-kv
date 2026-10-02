@@ -305,15 +305,28 @@ mod tests {
     use super::*;
     use crate::testutils::{TestResult, generate_rand_bytes, key, seeded_rng, value};
     use rand::Rng;
+    use rstest::{fixture, rstest};
     use tempfile::{TempDir, tempdir};
 
     const MAX_TEST_KEY_LEN: usize = u16::MAX as usize;
     const MAX_TEST_VAL_LEN: usize = u16::MAX as usize;
 
+    struct SSTableFixture {
+        // We return the temp dir so that it is not deleted until the test is
+        // done.
+        _dir: TempDir,
+        sstable: SsTable,
+        entries: Vec<(Key, Value)>,
+    }
+
     #[test]
     fn contains() -> TestResult<()> {
         let (mut rng, _) = seeded_rng(None);
-        let (_, sstable, entries) = create_random_sstable(100, &mut rng)?;
+        let SSTableFixture {
+            _dir,
+            sstable,
+            entries,
+        } = create_random_sstable(100, &mut rng)?;
         for (key, _) in entries {
             assert!(sstable.contains(&key));
         }
@@ -322,25 +335,48 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn seek_ge() -> TestResult<()> {
-        let (mut rng, _) = seeded_rng(None);
-        let (_, sstable, entries) = create_random_sstable(100, &mut rng)?;
+    #[fixture]
+    fn static_sstable() -> SSTableFixture {
+        let kvs = vec![
+            (key(b"apple"), value(b"fruit")),
+            (key(b"banana"), value(b"fruit")),
+            (key(b"carrot"), value(b"vegetable")),
+            (key(b"cabbage"), value(b"vegetable")),
+            (key(b"date"), value(b"fruit")),
+        ];
+        create_sstable_with_kvs(kvs).expect("failed to create static SSTable fixture")
+    }
+
+    #[rstest]
+    #[case::seek_to_existing_key(key(b"banana"), Some(key(b"banana")))]
+    #[case::seek_to_before_key(key(b"bad apple"), Some(key(b"banana")))]
+    #[case::seek_to_first_key(key(b"apple"), Some(key(b"apple")))]
+    #[case::seek_to_before_first_key(key(b"acerola"), Some(key(b"apple")))]
+    #[case::seek_to_after_last_key(key(b"dates"), None)]
+    fn seek_ge(
+        static_sstable: SSTableFixture,
+        #[case] seek_key: Key,
+        #[case] expected_key: Option<Key>,
+    ) -> TestResult<()> {
+        let SSTableFixture {
+            _dir,
+            sstable,
+            entries: _,
+        } = static_sstable;
+
         let mut iter = sstable.kv_iter();
-        for (key, value) in entries {
-            assert!(iter.seek_ge(&key)?);
-            assert_eq!(iter.key()?, Some(&key));
-            assert_eq!(iter.value()?, Some(&value));
+        let found = iter.seek_ge(&seek_key)?;
+        if let Some(expected_key) = expected_key {
+            assert!(found);
+            assert_eq!(iter.key()?, Some(&expected_key));
+        } else {
+            assert!(!found);
+            assert_eq!(iter.key()?, None);
         }
-        let non_existing_key = key(&generate_rand_bytes(10, &mut rng));
-        assert!(!iter.seek_ge(&non_existing_key)?);
         Ok(())
     }
 
-    fn create_random_sstable(
-        num_entries: u32,
-        mut rng: impl Rng,
-    ) -> TestResult<(TempDir, SsTable, Vec<(Key, Value)>)> {
+    fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<SSTableFixture> {
         let dir = tempdir().expect("create tmp dir");
         let tmp_sst = dir.path().join("tempdata.sst");
         let opts = SsTableOpts::default();
@@ -365,6 +401,32 @@ mod tests {
         builder.finish()?;
 
         let sstable = SsTable::open(&tmp_sst)?;
-        Ok((dir, sstable, entries))
+        Ok(SSTableFixture {
+            _dir: dir,
+            sstable,
+            entries,
+        })
+    }
+
+    fn create_sstable_with_kvs(mut kvs: Vec<(Key, Value)>) -> TestResult<SSTableFixture> {
+        let dir = tempdir().expect("create tmp dir");
+        let tmp_sst = dir.path().join("tempdata.sst");
+        let opts = SsTableOpts::default();
+        let mut builder = SsTableBuilder::new(&tmp_sst, opts)?;
+
+        // SSTable requires keys to be added in sorted order, so we sort.
+        kvs.sort_by(|(key1, _), (key2, _)| key1.cmp(key2));
+
+        for (key, value) in &kvs {
+            builder.add(key, value)?;
+        }
+        builder.finish()?;
+
+        let sstable = SsTable::open(&tmp_sst)?;
+        Ok(SSTableFixture {
+            _dir: dir,
+            sstable,
+            entries: kvs,
+        })
     }
 }

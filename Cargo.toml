@@ -14,6 +14,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3", "const_xxh3"] }
 
 [dev-dependencies]
 criterion = "0.8.2"
+rstest = "0.27.0"
 tempfile = "3.26.0"
 
 [features]
