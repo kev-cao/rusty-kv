@@ -80,7 +80,7 @@ fn create_seed(n: u32) -> u64 {
     const_xxh3(&n.to_le_bytes())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BloomFilterOpts {
     pub filter_size: u32,
     pub num_hashes: u32,

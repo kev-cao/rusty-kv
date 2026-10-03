@@ -2,24 +2,23 @@ mod bloom;
 mod footer;
 mod index;
 mod iterator;
+#[cfg(test)]
+mod testutils;
 
 use snafu::prelude::*;
 use std::{
-    borrow::Borrow,
     fs,
     io::{self, Seek, SeekFrom, Write},
-    os::unix::fs::FileExt,
     path::{self, PathBuf},
 };
 
 use crate::storage::{
-    collections::KVIterator,
-    kv::{Key, Value},
-    sstable::footer::SsTableFooterTail,
-};
-use crate::storage::{
     encoding::Codable,
     sstable::footer::{FOOTER_TAIL_SIZE, SsTableFooter},
+};
+use crate::storage::{
+    kv::{Key, Value},
+    sstable::footer::SsTableFooterTail,
 };
 
 pub const SST_VERSION: u16 = 1;
@@ -92,125 +91,12 @@ impl SsTable {
     }
 
     /// Returns an iterator over the key-value pairs in the SSTable.
-    pub fn kv_iter<'a>(&'a self) -> SsTableIterator<'a> {
-        SsTableIterator::new(self)
+    pub fn kv_iter<'a>(&'a self) -> iterator::SsTableIterator<'a> {
+        iterator::SsTableIterator::new(self)
     }
 }
 
-pub struct SsTableIterator<'a> {
-    sstable: &'a SsTable,
-    key: Option<Key>,
-    value: Option<Value>,
-    curr_block: Option<CurrentBlock<'a>>,
-}
-
-struct CurrentBlock<'a> {
-    entry: &'a index::SsTableIndexEntry,
-    entry_index: usize,
-    cursor: io::Cursor<Vec<u8>>,
-}
-
-impl<'a> SsTableIterator<'a> {
-    pub fn new(sstable: &'a SsTable) -> Self {
-        Self {
-            key: None,
-            value: None,
-            curr_block: None,
-            sstable,
-        }
-    }
-
-    fn seek_ge_in_block<Q>(&mut self, key: &Q) -> Result<bool, SsTableError>
-    where
-        Key: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        self.key = None;
-        self.value = None;
-        let Some(curr_block) = &mut self.curr_block else {
-            println!("No current block found for key");
-            return Ok(false);
-        };
-        curr_block.cursor.set_position(0);
-        let mut curr_key = Key::decode(&mut curr_block.cursor)?;
-        while curr_key.borrow() < key {
-            let value_len = Value::decode_len(&mut curr_block.cursor)?;
-            curr_block
-                .cursor
-                .seek(SeekFrom::Current(value_len.into()))?;
-            if curr_block.cursor.position() >= curr_block.entry.block_size.into() {
-                return Ok(false);
-            }
-            curr_key = Key::decode(&mut curr_block.cursor)?;
-        }
-        self.key = Some(curr_key);
-        self.value = Some(Value::decode(&mut curr_block.cursor)?);
-        Ok(true)
-    }
-}
-
-impl<'a> KVIterator for SsTableIterator<'a> {
-    type Key = Key;
-    type Value = Value;
-    type Error = SsTableError;
-
-    fn key(&self) -> Result<Option<&Self::Key>, Self::Error> {
-        Ok(self.key.as_ref())
-    }
-
-    fn value(&self) -> Result<Option<&Self::Value>, Self::Error> {
-        Ok(self.value.as_ref())
-    }
-
-    fn next(&mut self) -> Result<bool, Self::Error> {
-        unimplemented!()
-    }
-
-    fn seek_ge<Q>(&mut self, key: &Q) -> Result<bool, Self::Error>
-    where
-        Self::Key: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        let Some((entry, entry_index)) = self.sstable.index.key_block(key) else {
-            return Ok(false);
-        };
-        if let Some(curr_block) = &self.curr_block
-            && curr_block.entry_index == entry_index
-        {
-            // We are already in the correct block, just seek within it.
-            return self.seek_ge_in_block(key);
-        }
-        let curr_block = match &mut self.curr_block {
-            Some(block) => block,
-            None => {
-                self.curr_block = Some(CurrentBlock {
-                    entry,
-                    entry_index,
-                    cursor: io::Cursor::new(vec![0; entry.block_size as usize]),
-                });
-                self.curr_block.as_mut().unwrap()
-            }
-        };
-        curr_block
-            .cursor
-            .get_mut()
-            .resize(entry.block_size as usize, 0);
-        self.sstable
-            .file
-            .read_exact_at(curr_block.cursor.get_mut(), entry.block_offset)?;
-        self.seek_ge_in_block(key)
-    }
-
-    fn seek_lt<Q>(&mut self, key: &Q) -> Result<bool, Self::Error>
-    where
-        Self::Key: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        unimplemented!()
-    }
-}
-
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
 pub struct SsTableOpts {
     pub index_opts: index::SsTableIndexOpts,
     pub filter_opts: bloom::BloomFilterOpts,
@@ -302,21 +188,31 @@ impl SsTableBuilder {
 
 #[cfg(test)]
 mod tests {
+    use super::testutils::*;
     use super::*;
     use crate::testutils::{TestResult, generate_rand_bytes, key, seeded_rng, value};
-    use rand::Rng;
-    use rstest::{fixture, rstest};
-    use tempfile::{TempDir, tempdir};
+    use tempfile::tempdir;
 
-    const MAX_TEST_KEY_LEN: usize = u16::MAX as usize;
-    const MAX_TEST_VAL_LEN: usize = u16::MAX as usize;
+    #[test]
+    fn sstable_encoding() -> TestResult<()> {
+        let dir = tempdir().expect("create tmp dir");
+        let tmp_sst = dir.path().join("tempdata.sst");
+        let opts = SsTableOpts::default();
+        let mut builder = SsTableBuilder::new(&tmp_sst, opts)?;
+        builder.add(&key(b"key1"), &value(b"value1"))?;
+        builder.add(&key(b"key2"), &value(b"value2"))?;
+        builder.finish()?;
 
-    struct SSTableFixture {
-        // We return the temp dir so that it is not deleted until the test is
-        // done.
-        _dir: TempDir,
-        sstable: SsTable,
-        entries: Vec<(Key, Value)>,
+        let sstable = SsTable::open(&tmp_sst)?;
+        assert_eq!(SsTableOpts::default(), sstable.opts);
+        assert!(!sstable.index.0.is_empty());
+        assert!(sstable.footer.filter_size > 0);
+        assert!(sstable.footer.index_size > 0);
+        assert!(sstable.footer.opts_size > 0);
+        assert!(sstable.footer.filter_offset > 0);
+        assert!(sstable.footer.index_offset > 0);
+        assert!(sstable.footer.opts_offset > 0);
+        Ok(())
     }
 
     #[test]
@@ -333,100 +229,5 @@ mod tests {
         let non_existing_key = key(&generate_rand_bytes(10, &mut rng));
         assert!(!sstable.contains(&non_existing_key));
         Ok(())
-    }
-
-    #[fixture]
-    fn static_sstable() -> SSTableFixture {
-        let kvs = vec![
-            (key(b"apple"), value(b"fruit")),
-            (key(b"banana"), value(b"fruit")),
-            (key(b"carrot"), value(b"vegetable")),
-            (key(b"cabbage"), value(b"vegetable")),
-            (key(b"date"), value(b"fruit")),
-        ];
-        create_sstable_with_kvs(kvs).expect("failed to create static SSTable fixture")
-    }
-
-    #[rstest]
-    #[case::seek_to_existing_key(key(b"banana"), Some(key(b"banana")))]
-    #[case::seek_to_before_key(key(b"bad apple"), Some(key(b"banana")))]
-    #[case::seek_to_first_key(key(b"apple"), Some(key(b"apple")))]
-    #[case::seek_to_before_first_key(key(b"acerola"), Some(key(b"apple")))]
-    #[case::seek_to_after_last_key(key(b"dates"), None)]
-    fn seek_ge(
-        static_sstable: SSTableFixture,
-        #[case] seek_key: Key,
-        #[case] expected_key: Option<Key>,
-    ) -> TestResult<()> {
-        let SSTableFixture {
-            _dir,
-            sstable,
-            entries: _,
-        } = static_sstable;
-
-        let mut iter = sstable.kv_iter();
-        let found = iter.seek_ge(&seek_key)?;
-        if let Some(expected_key) = expected_key {
-            assert!(found);
-            assert_eq!(iter.key()?, Some(&expected_key));
-        } else {
-            assert!(!found);
-            assert_eq!(iter.key()?, None);
-        }
-        Ok(())
-    }
-
-    fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<SSTableFixture> {
-        let dir = tempdir().expect("create tmp dir");
-        let tmp_sst = dir.path().join("tempdata.sst");
-        let opts = SsTableOpts::default();
-        let mut builder = SsTableBuilder::new(&tmp_sst, opts)?;
-
-        let mut entries = Vec::new();
-        // Inserting data into an SSTable must always be in sorted order, so we
-        // generate random keys but prefix them with a monotonically increasing
-        // number to ensure they are sorted.
-        for (prefix, _) in (0..num_entries).enumerate() {
-            let key_len = rng.random_range(0..=MAX_TEST_KEY_LEN - size_of_val(&num_entries));
-            let val_len = rng.random_range(0..=MAX_TEST_VAL_LEN);
-            let key = key(&[
-                &prefix.to_be_bytes(),
-                generate_rand_bytes(key_len, &mut rng).as_slice(),
-            ]
-            .concat());
-            let value = value(&generate_rand_bytes(val_len, &mut rng));
-            builder.add(&key, &value)?;
-            entries.push((key, value));
-        }
-        builder.finish()?;
-
-        let sstable = SsTable::open(&tmp_sst)?;
-        Ok(SSTableFixture {
-            _dir: dir,
-            sstable,
-            entries,
-        })
-    }
-
-    fn create_sstable_with_kvs(mut kvs: Vec<(Key, Value)>) -> TestResult<SSTableFixture> {
-        let dir = tempdir().expect("create tmp dir");
-        let tmp_sst = dir.path().join("tempdata.sst");
-        let opts = SsTableOpts::default();
-        let mut builder = SsTableBuilder::new(&tmp_sst, opts)?;
-
-        // SSTable requires keys to be added in sorted order, so we sort.
-        kvs.sort_by(|(key1, _), (key2, _)| key1.cmp(key2));
-
-        for (key, value) in &kvs {
-            builder.add(key, value)?;
-        }
-        builder.finish()?;
-
-        let sstable = SsTable::open(&tmp_sst)?;
-        Ok(SSTableFixture {
-            _dir: dir,
-            sstable,
-            entries: kvs,
-        })
     }
 }

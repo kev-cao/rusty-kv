@@ -18,10 +18,10 @@ impl Codable for SsTableIndexEntry {
     type DecodeErr = io::Error;
 
     fn encode(&self, writer: &mut impl io::Write) -> Result<usize, Self::EncodeErr> {
-        self.last_key.encode(writer)?;
+        let key_length = self.last_key.encode(writer)?;
         writer.write_u64::<LittleEndian>(self.block_offset)?;
         writer.write_u32::<LittleEndian>(self.block_size)?;
-        Ok(size_of_val(&self.block_offset) + size_of_val(&self.block_size))
+        Ok(key_length + size_of_val(&self.block_offset) + size_of_val(&self.block_size))
     }
 
     fn decode(reader: &mut impl io::Read) -> Result<Self, Self::DecodeErr> {
@@ -101,7 +101,7 @@ impl Codable for SsTableIndex {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SsTableIndexOpts {
     pub block_max_size: u32,
 }
