@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn contains() -> TestResult<()> {
         let (mut rng, _) = seeded_rng(None);
-        let SSTableFixture {
+        let SsTableFixture {
             _dir,
             sstable,
             entries,

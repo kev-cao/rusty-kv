@@ -7,15 +7,27 @@ use super::*;
 const MAX_TEST_KEY_LEN: usize = u16::MAX as usize;
 const MAX_TEST_VAL_LEN: usize = u16::MAX as usize;
 
-pub struct SSTableFixture {
+pub struct SsTableFixture {
     // We return the temp dir so that it is not deleted until the test is
     // done.
     pub _dir: TempDir,
     pub sstable: SsTable,
+    /// Contains the entries that were added to the SSTable, in sorted order.
     pub entries: Vec<(Key, Value)>,
 }
 
-pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<SSTableFixture> {
+impl SsTableFixture {
+    /// Fetches the expected value for a given key from the entries that were
+    /// added to the SSTable.
+    pub fn get_value(&self, key: &Key) -> Option<&Value> {
+        self.entries
+            .binary_search_by(|(k, _)| k.cmp(key))
+            .ok()
+            .map(|idx| &self.entries[idx].1)
+    }
+}
+
+pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<SsTableFixture> {
     let dir = tempdir().expect("create tmp dir");
     let tmp_sst = dir.path().join("tempdata.sst");
     let opts = SsTableOpts::default();
@@ -40,14 +52,14 @@ pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<
     builder.finish()?;
 
     let sstable = SsTable::open(&tmp_sst)?;
-    Ok(SSTableFixture {
+    Ok(SsTableFixture {
         _dir: dir,
         sstable,
         entries,
     })
 }
 
-pub fn create_sstable_with_kvs(mut kvs: Vec<(Key, Value)>) -> TestResult<SSTableFixture> {
+pub fn create_sstable_with_kvs(mut kvs: Vec<(Key, Value)>) -> TestResult<SsTableFixture> {
     let dir = tempdir().expect("create tmp dir");
     let tmp_sst = dir.path().join("tempdata.sst");
     let opts = SsTableOpts::default();
@@ -62,7 +74,7 @@ pub fn create_sstable_with_kvs(mut kvs: Vec<(Key, Value)>) -> TestResult<SSTable
     builder.finish()?;
 
     let sstable = SsTable::open(&tmp_sst)?;
-    Ok(SSTableFixture {
+    Ok(SsTableFixture {
         _dir: dir,
         sstable,
         entries: kvs,

@@ -1,6 +1,7 @@
 use std::{
     borrow::Borrow,
     io::{self, Seek, SeekFrom},
+    mem,
     os::unix::fs::FileExt,
 };
 
@@ -16,7 +17,13 @@ pub struct SsTableIterator<'a> {
     sstable: &'a SsTable,
     key: Option<Key>,
     value: Option<Value>,
+    /// An invariant should be upheld that if `curr_block` is `Some`, then the
+    /// cursor is always positioned on valid data read from the block.
     curr_block: Option<CurrentBlock<'a>>,
+    /// This serves as an intermediary buffer for reading blocks from the
+    /// SSTable. This avoids new allocations when reading blocks, while also
+    /// preventing read errors from corrupting the curr_block state.
+    scratch: Vec<u8>,
 }
 
 struct CurrentBlock<'a> {
@@ -31,6 +38,7 @@ impl<'a> SsTableIterator<'a> {
             key: None,
             value: None,
             curr_block: None,
+            scratch: vec![],
             sstable,
         }
     }
@@ -40,10 +48,7 @@ impl<'a> SsTableIterator<'a> {
         Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        self.key = None;
-        self.value = None;
         let Some(curr_block) = &mut self.curr_block else {
-            println!("No current block found for key");
             return Ok(false);
         };
         curr_block.cursor.set_position(0);
@@ -58,8 +63,38 @@ impl<'a> SsTableIterator<'a> {
             }
             curr_key = Key::decode(&mut curr_block.cursor)?;
         }
-        self.key = Some(curr_key);
         self.value = Some(Value::decode(&mut curr_block.cursor)?);
+        self.key = Some(curr_key);
+        Ok(true)
+    }
+
+    /// Resets the iterator.
+    pub fn reset(&mut self) {
+        self.key = None;
+        self.value = None;
+        self.curr_block = None;
+    }
+
+    /// Loads the block at the given index into the iterator. Returns true if the
+    /// block was loaded, false if the index is out of bounds.
+    fn load_block_n(&mut self, n: usize) -> Result<bool, SsTableError> {
+        let Some(entry) = self.sstable.index.0.get(n) else {
+            return Ok(false);
+        };
+        self.scratch.resize(entry.block_size as usize, 0);
+        self.sstable
+            .file
+            .read_exact_at(self.scratch.as_mut_slice(), entry.block_offset)?;
+        let Some(block) = &mut self.curr_block else {
+            self.curr_block = Some(CurrentBlock {
+                entry,
+                entry_index: n,
+                cursor: io::Cursor::new(mem::take(&mut self.scratch)),
+            });
+            return Ok(true);
+        };
+        mem::swap(block.cursor.get_mut(), &mut self.scratch);
+        block.cursor.set_position(0);
         Ok(true)
     }
 }
@@ -78,7 +113,31 @@ impl<'a> KVIterator for SsTableIterator<'a> {
     }
 
     fn next(&mut self) -> Result<bool, Self::Error> {
-        unimplemented!()
+        let mut curr_block = match &mut self.curr_block {
+            Some(block) => block,
+            None => {
+                if !self.load_block_n(0)? {
+                    self.key = None;
+                    self.value = None;
+                    return Ok(false);
+                }
+                self.curr_block.as_mut().unwrap()
+            }
+        };
+        if curr_block.cursor.position() >= curr_block.cursor.get_ref().len() as u64 {
+            let next_idx = curr_block.entry_index + 1;
+            if !self.load_block_n(next_idx)? {
+                self.key = None;
+                self.value = None;
+                return Ok(false);
+            }
+            curr_block = self.curr_block.as_mut().unwrap();
+        }
+        let next_key = Some(Key::decode(&mut curr_block.cursor)?);
+        let next_value = Some(Value::decode(&mut curr_block.cursor)?);
+        self.key = next_key;
+        self.value = next_value;
+        Ok(true)
     }
 
     fn seek_ge<Q>(&mut self, key: &Q) -> Result<bool, Self::Error>
@@ -86,7 +145,7 @@ impl<'a> KVIterator for SsTableIterator<'a> {
         Self::Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let Some((entry, entry_index)) = self.sstable.index.key_block(key) else {
+        let Some((_, entry_index)) = self.sstable.index.key_block(key) else {
             return Ok(false);
         };
         if let Some(curr_block) = &self.curr_block
@@ -95,24 +154,7 @@ impl<'a> KVIterator for SsTableIterator<'a> {
             // We are already in the correct block, just seek within it.
             return self.seek_ge_in_block(key);
         }
-        let curr_block = match &mut self.curr_block {
-            Some(block) => block,
-            None => {
-                self.curr_block = Some(CurrentBlock {
-                    entry,
-                    entry_index,
-                    cursor: io::Cursor::new(vec![0; entry.block_size as usize]),
-                });
-                self.curr_block.as_mut().unwrap()
-            }
-        };
-        curr_block
-            .cursor
-            .get_mut()
-            .resize(entry.block_size as usize, 0);
-        self.sstable
-            .file
-            .read_exact_at(curr_block.cursor.get_mut(), entry.block_offset)?;
+        self.load_block_n(entry_index)?;
         self.seek_ge_in_block(key)
     }
 
@@ -133,13 +175,13 @@ mod tests {
     use rstest::{fixture, rstest};
 
     #[fixture]
-    fn static_sstable() -> SSTableFixture {
+    fn static_sstable() -> SsTableFixture {
         let kvs = vec![
             (key(b"apple"), value(b"fruit")),
             (key(b"banana"), value(b"fruit")),
             (key(b"carrot"), value(b"vegetable")),
             (key(b"cabbage"), value(b"vegetable")),
-            (key(b"date"), value(b"fruit")),
+            (key(b"durian"), value(b"fruit")),
         ];
         create_sstable_with_kvs(kvs).expect("failed to create static SSTable fixture")
     }
@@ -149,13 +191,13 @@ mod tests {
     #[case::seek_to_before_key(key(b"bad apple"), Some(key(b"banana")))]
     #[case::seek_to_first_key(key(b"apple"), Some(key(b"apple")))]
     #[case::seek_to_before_first_key(key(b"acerola"), Some(key(b"apple")))]
-    #[case::seek_to_after_last_key(key(b"dates"), None)]
+    #[case::seek_to_after_last_key(key(b"dwarf mulberry"), None)]
     fn seek_ge(
-        static_sstable: SSTableFixture,
+        static_sstable: SsTableFixture,
         #[case] seek_key: Key,
         #[case] expected_key: Option<Key>,
     ) -> TestResult<()> {
-        let SSTableFixture {
+        let SsTableFixture {
             _dir,
             sstable,
             entries: _,
@@ -168,6 +210,52 @@ mod tests {
             assert_eq!(iter.key()?, Some(&expected_key));
         } else {
             assert!(!found);
+            assert_eq!(iter.key()?, None);
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    fn next(static_sstable: SsTableFixture) -> TestResult<()> {
+        let SsTableFixture {
+            _dir,
+            sstable,
+            entries,
+        } = static_sstable;
+
+        let mut iter = sstable.kv_iter();
+        for (expected_key, expected_value) in entries {
+            let has_next = iter.next()?;
+            assert!(has_next);
+            assert_eq!(iter.key()?, Some(&expected_key));
+            assert_eq!(iter.value()?, Some(&expected_value));
+        }
+        // After all entries have been iterated, next should return false.
+        assert!(!iter.next()?);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::seek_to_first_key(key(b"apple"), Some(key(b"banana")))]
+    #[case::seek_before_first_key(key(b"acerola"), Some(key(b"banana")))]
+    #[case::seek_to_second_to_last_key(key(b"carrot"), Some(key(b"durian")))]
+    #[case::seek_to_before_last_key(key(b"date"), None)]
+    #[case::seek_to_last_key(key(b"durian"), None)]
+    fn seek_ge_next(
+        static_sstable: SsTableFixture,
+        #[case] seek_key: Key,
+        #[case] next_key: Option<Key>,
+    ) -> TestResult<()> {
+        let mut iter = static_sstable.sstable.kv_iter();
+        let found = iter.seek_ge(&seek_key)?;
+        assert!(found, "test assumes seek_ge should find a key");
+        let has_next = iter.next()?;
+        if let Some(next_key) = next_key {
+            assert!(has_next);
+            assert_eq!(iter.key()?, Some(&next_key));
+            assert_eq!(iter.value()?, static_sstable.get_value(&next_key));
+        } else {
+            assert!(!has_next);
             assert_eq!(iter.key()?, None);
         }
         Ok(())
