@@ -95,6 +95,8 @@ impl<'a> SsTableIterator<'a> {
         };
         mem::swap(block.cursor.get_mut(), &mut self.scratch);
         block.cursor.set_position(0);
+        block.entry_index = n;
+        block.entry = entry;
         Ok(true)
     }
 }
@@ -169,6 +171,7 @@ impl<'a> KVIterator for SsTableIterator<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::SsTableOpts;
     use super::super::testutils::*;
     use super::*;
     use crate::testutils::{TestResult, key, value};
@@ -179,11 +182,20 @@ mod tests {
         let kvs = vec![
             (key(b"apple"), value(b"fruit")),
             (key(b"banana"), value(b"fruit")),
-            (key(b"carrot"), value(b"vegetable")),
             (key(b"cabbage"), value(b"vegetable")),
+            (key(b"carrot"), value(b"vegetable")),
             (key(b"durian"), value(b"fruit")),
         ];
-        create_sstable_with_kvs(kvs).expect("failed to create static SSTable fixture")
+        // We artificially lower the block size to force multiple blocks to be
+        // created for the test data.
+        create_sstable_with_kvs(
+            kvs,
+            SsTableOpts {
+                index_opts: index::SsTableIndexOpts { block_max_size: 48 },
+                ..Default::default()
+            },
+        )
+        .expect("failed to create static SSTable fixture")
     }
 
     #[rstest]
@@ -230,7 +242,6 @@ mod tests {
             assert_eq!(iter.key()?, Some(&expected_key));
             assert_eq!(iter.value()?, Some(&expected_value));
         }
-        // After all entries have been iterated, next should return false.
         assert!(!iter.next()?);
         Ok(())
     }

@@ -146,7 +146,7 @@ impl SsTableIndexBuilder {
 
     /// Records the addition of a new key to the index. Key represents the
     /// logical key being added, while enc_kv_len represents the length of the
-    /// on-disk encoded key.
+    /// on-disk encoded key and value pair.
     pub fn add_key(&mut self, key: &Key, enc_kv_len: usize) {
         let needs_new_block = match &self.current_block {
             None => true,

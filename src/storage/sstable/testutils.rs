@@ -59,10 +59,12 @@ pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<
     })
 }
 
-pub fn create_sstable_with_kvs(mut kvs: Vec<(Key, Value)>) -> TestResult<SsTableFixture> {
+pub fn create_sstable_with_kvs(
+    mut kvs: Vec<(Key, Value)>,
+    opts: SsTableOpts,
+) -> TestResult<SsTableFixture> {
     let dir = tempdir().expect("create tmp dir");
     let tmp_sst = dir.path().join("tempdata.sst");
-    let opts = SsTableOpts::default();
     let mut builder = SsTableBuilder::new(&tmp_sst, opts)?;
 
     // SSTable requires keys to be added in sorted order, so we sort.
