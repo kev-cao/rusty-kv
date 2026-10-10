@@ -10,7 +10,8 @@ const MAX_TEST_VAL_LEN: usize = u16::MAX as usize;
 pub struct SsTableFixture {
     // We return the temp dir so that it is not deleted until the test is
     // done.
-    pub _dir: TempDir,
+    pub dir: TempDir,
+    pub filepath: PathBuf,
     pub sstable: SsTable,
     /// Contains the entries that were added to the SSTable, in sorted order.
     pub entries: Vec<(Key, Value)>,
@@ -53,7 +54,8 @@ pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<
 
     let sstable = SsTable::open(&tmp_sst)?;
     Ok(SsTableFixture {
-        _dir: dir,
+        dir,
+        filepath: tmp_sst,
         sstable,
         entries,
     })
@@ -77,7 +79,8 @@ pub fn create_sstable_with_kvs(
 
     let sstable = SsTable::open(&tmp_sst)?;
     Ok(SsTableFixture {
-        _dir: dir,
+        dir,
+        filepath: tmp_sst,
         sstable,
         entries: kvs,
     })

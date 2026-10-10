@@ -219,7 +219,8 @@ mod tests {
     fn contains() -> TestResult<()> {
         let (mut rng, _) = seeded_rng(None);
         let SsTableFixture {
-            _dir,
+            dir: _,
+            filepath: _,
             sstable,
             entries,
         } = create_random_sstable(100, &mut rng)?;
