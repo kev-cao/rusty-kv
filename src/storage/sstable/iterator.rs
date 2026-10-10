@@ -30,6 +30,7 @@ pub enum SsTableIteratorError {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum SsTableIteratorState {
     /// The iterator is positioned at a valid key-value pair.
     Valid,
@@ -357,6 +358,7 @@ mod tests {
         assert!(!iter.next()?);
         assert_eq!(iter.key()?, None);
         assert_eq!(iter.value()?, None);
+        assert_eq!(iter.state, SsTableIteratorState::Exhausted);
         iter.reset();
         assert!(iter.next()?);
         assert_eq!(iter.key()?, Some(&entries[0].0));
