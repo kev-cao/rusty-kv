@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::FileExt,
 };
 
-use super::{SsTableError, index};
+use super::index;
 use crate::storage::sstable::SsTable;
 use crate::storage::{
     collections::KVIterator,
@@ -244,6 +244,7 @@ mod tests {
     use super::*;
     use crate::testutils::{TestResult, key, value};
     use rstest::{fixture, rstest};
+    use std::assert_matches;
 
     #[fixture]
     fn static_sstable() -> SsTableFixture {
@@ -298,9 +299,9 @@ mod tests {
     fn next(
         #[from(static_sstable)] SsTableFixture {
             sstable,
+            entries,
             dir: _,
             filepath: _,
-            entries: _,
         }: SsTableFixture,
     ) -> TestResult<()> {
         let mut iter = sstable.kv_iter();
@@ -360,6 +361,63 @@ mod tests {
         assert!(iter.next()?);
         assert_eq!(iter.key()?, Some(&entries[0].0));
         assert_eq!(iter.value()?, Some(&entries[0].1));
+        Ok(())
+    }
+
+    #[rstest]
+    fn poisoned_iter(
+        #[from(static_sstable)] SsTableFixture {
+            sstable,
+            filepath,
+            entries,
+            dir: _,
+        }: SsTableFixture,
+    ) -> TestResult<()> {
+        let mut iter = sstable.kv_iter();
+        for _ in 0..2 {
+            assert!(iter.next()?);
+        }
+        // Corrupt the SSTable file to simulate an I/O error. In order to
+        // validate that the iterator works after poisoning and resetting, we'll
+        // only corrupt the file at the point where the iterator is currently
+        // positioned.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(&filepath)
+            .expect("failed to open SSTable file");
+        let curr_block = iter
+            .curr_block
+            .as_ref()
+            .expect("iterator should have a current block");
+        let current_pos = curr_block.entry.block_offset + curr_block.cursor.position();
+        file.write_at(&[0xFF; 64], current_pos)
+            .expect("failed to corrupt SSTable file");
+
+        assert!(iter.next().is_err());
+        assert_matches!(
+            iter.next()
+                .expect_err("expected poisoned iterator to return an error"),
+            SsTableIteratorError::IteratorPoisoned { .. },
+        );
+
+        iter.reset();
+        for (key, value) in entries.iter().take(2) {
+            assert!(iter.next()?);
+            assert_eq!(iter.key()?, Some(key));
+            assert_eq!(iter.value()?, Some(value));
+        }
+
+        assert!(iter.next().is_err());
+        assert_matches!(
+            iter.next()
+                .expect_err("expected poisoned iterator to return an error"),
+            SsTableIteratorError::IteratorPoisoned { .. }
+        );
+
+        // Using a seek instead of reset after poisoning should also work.
+        iter.seek_ge(&key(b"apple"))?;
+        assert_eq!(iter.key()?, Some(&key(b"apple")));
         Ok(())
     }
 }
