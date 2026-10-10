@@ -138,7 +138,7 @@ impl TryFrom<&[u8]> for Value {
     type Error = ValueError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() > KEY_LEN_MAX as usize {
+        if value.len() > VALUE_LEN_MAX as usize {
             return ValueLenExceededSnafu {
                 actual_size: value.len(),
             }
