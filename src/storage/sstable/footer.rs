@@ -10,7 +10,7 @@ pub const FOOTER_TAIL_SIZE: usize = 18;
 
 // NB: If a new field is added to the footer, the FOOTER_SIZE constant must be
 // updated.
-const FOOTER_SIZE: usize = 24 + FOOTER_TAIL_SIZE;
+const FOOTER_SIZE: usize = 24;
 
 const FOOTER_MAGIC: u64 = 0xdeadcafedeadcafe;
 
@@ -30,7 +30,7 @@ impl SsTableFooterTail {
     pub fn new() -> Self {
         Self {
             sst_version: SST_VERSION,
-            footer_size: FOOTER_SIZE as u64,
+            footer_size: FOOTER_SIZE as u64 + FOOTER_TAIL_SIZE as u64,
             magic: FOOTER_MAGIC,
         }
     }
@@ -123,5 +123,25 @@ impl Codable for SsTableFooter {
         };
         ret.validate()?;
         Ok(ret)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutils::TestResult;
+
+    #[test]
+    fn footer_size() -> TestResult<()> {
+        let mut bytes = Vec::new();
+        SsTableFooter {
+            filter_offset: 0,
+            filter_size: 10,
+            index_offset: 10,
+            index_size: 10,
+        }
+        .encode(&mut bytes)?;
+        assert_eq!(bytes.len(), FOOTER_SIZE);
+        Ok(())
     }
 }
