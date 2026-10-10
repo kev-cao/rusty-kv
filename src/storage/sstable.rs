@@ -41,7 +41,6 @@ pub struct SsTable {
     path: PathBuf,
     filter: bloom::BloomFilter,
     index: index::SsTableIndex,
-    opts: SsTableOpts,
     footer: SsTableFooter,
     file: fs::File,
 }
@@ -63,14 +62,10 @@ impl SsTable {
         file.seek(SeekFrom::Start(footer.index_offset))?;
         let index = index::SsTableIndex::decode(&mut file)?;
 
-        file.seek(SeekFrom::Start(footer.opts_offset))?;
-        let opts = SsTableOpts::decode(&mut file)?;
-
         Ok(Self {
             path,
             filter,
             index,
-            opts,
             footer,
             file,
         })
@@ -97,12 +92,12 @@ impl SsTable {
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
-pub struct SsTableOpts {
+pub struct SsTableBuildOpts {
     pub index_opts: index::SsTableIndexOpts,
     pub filter_opts: bloom::BloomFilterOpts,
 }
 
-impl Codable for SsTableOpts {
+impl Codable for SsTableBuildOpts {
     type EncodeErr = io::Error;
     type DecodeErr = io::Error;
 
@@ -129,11 +124,11 @@ pub struct SsTableBuilder {
     filter_offset: u64,
     filter: bloom::BloomFilterBuilder,
     index: index::SsTableIndexBuilder,
-    opts: SsTableOpts,
+    opts: SsTableBuildOpts,
 }
 
 impl SsTableBuilder {
-    pub fn new(path: impl AsRef<path::Path>, opts: SsTableOpts) -> Result<Self, SsTableError> {
+    pub fn new(path: impl AsRef<path::Path>, opts: SsTableBuildOpts) -> Result<Self, SsTableError> {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             writer: io::BufWriter::new(
@@ -168,16 +163,12 @@ impl SsTableBuilder {
             filter_size: 0,
             index_offset: 0,
             index_size: 0,
-            opts_offset: 0,
-            opts_size: 0,
         };
         let index = self.index.finish();
         let filter = self.filter.finish();
         footer.filter_size = filter.encode(&mut self.writer)? as u32;
         footer.index_offset = footer.filter_offset + footer.filter_size as u64;
         footer.index_size = index.encode(&mut self.writer)? as u32;
-        footer.opts_offset = footer.index_offset + footer.index_size as u64;
-        footer.opts_size = self.opts.encode(&mut self.writer)? as u32;
         footer.encode(&mut self.writer)?;
         SsTableFooterTail::new().encode(&mut self.writer)?;
         self.writer.flush()?;
@@ -197,21 +188,18 @@ mod tests {
     fn sstable_encoding() -> TestResult<()> {
         let dir = tempdir().expect("create tmp dir");
         let tmp_sst = dir.path().join("tempdata.sst");
-        let opts = SsTableOpts::default();
+        let opts = SsTableBuildOpts::default();
         let mut builder = SsTableBuilder::new(&tmp_sst, opts)?;
         builder.add(&key(b"key1"), &value(b"value1"))?;
         builder.add(&key(b"key2"), &value(b"value2"))?;
         builder.finish()?;
 
         let sstable = SsTable::open(&tmp_sst)?;
-        assert_eq!(SsTableOpts::default(), sstable.opts);
         assert!(!sstable.index.0.is_empty());
         assert!(sstable.footer.filter_size > 0);
         assert!(sstable.footer.index_size > 0);
-        assert!(sstable.footer.opts_size > 0);
         assert!(sstable.footer.filter_offset > 0);
         assert!(sstable.footer.index_offset > 0);
-        assert!(sstable.footer.opts_offset > 0);
         Ok(())
     }
 

@@ -240,7 +240,7 @@ impl<'a> KVIterator for SsTableIterator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::SsTableOpts;
+    use super::super::SsTableBuildOpts;
     use super::super::testutils::*;
     use super::*;
     use crate::testutils::{TestResult, key, value};
@@ -260,7 +260,7 @@ mod tests {
         // created for the test data.
         create_sstable_with_kvs(
             kvs,
-            SsTableOpts {
+            SsTableBuildOpts {
                 index_opts: index::SsTableIndexOpts { block_max_size: 48 },
                 ..Default::default()
             },

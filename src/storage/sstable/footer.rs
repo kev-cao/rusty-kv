@@ -10,7 +10,7 @@ pub const FOOTER_TAIL_SIZE: usize = 18;
 
 // NB: If a new field is added to the footer, the FOOTER_SIZE constant must be
 // updated.
-const FOOTER_SIZE: usize = 36 + FOOTER_TAIL_SIZE;
+const FOOTER_SIZE: usize = 24 + FOOTER_TAIL_SIZE;
 
 const FOOTER_MAGIC: u64 = 0xdeadcafedeadcafe;
 
@@ -75,8 +75,6 @@ pub struct SsTableFooter {
     pub filter_size: u32,
     pub index_offset: u64,
     pub index_size: u32,
-    pub opts_offset: u64,
-    pub opts_size: u32,
 }
 
 impl SsTableFooter {
@@ -110,14 +108,10 @@ impl Codable for SsTableFooter {
         writer.write_u32::<LittleEndian>(self.filter_size)?;
         writer.write_u64::<LittleEndian>(self.index_offset)?;
         writer.write_u32::<LittleEndian>(self.index_size)?;
-        writer.write_u64::<LittleEndian>(self.opts_offset)?;
-        writer.write_u32::<LittleEndian>(self.opts_size)?;
         Ok(size_of_val(&self.filter_offset)
             + size_of_val(&self.filter_size)
             + size_of_val(&self.index_offset)
-            + size_of_val(&self.index_size)
-            + size_of_val(&self.opts_offset)
-            + size_of_val(&self.opts_size))
+            + size_of_val(&self.index_size))
     }
 
     fn decode(reader: &mut impl io::Read) -> Result<Self, Self::DecodeErr> {
@@ -126,8 +120,6 @@ impl Codable for SsTableFooter {
             filter_size: reader.read_u32::<LittleEndian>()?,
             index_offset: reader.read_u64::<LittleEndian>()?,
             index_size: reader.read_u32::<LittleEndian>()?,
-            opts_offset: reader.read_u64::<LittleEndian>()?,
-            opts_size: reader.read_u32::<LittleEndian>()?,
         };
         ret.validate()?;
         Ok(ret)

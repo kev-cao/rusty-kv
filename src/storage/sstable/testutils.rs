@@ -31,7 +31,7 @@ impl SsTableFixture {
 pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<SsTableFixture> {
     let dir = tempdir().expect("create tmp dir");
     let tmp_sst = dir.path().join("tempdata.sst");
-    let opts = SsTableOpts::default();
+    let opts = SsTableBuildOpts::default();
     let mut builder = SsTableBuilder::new(&tmp_sst, opts)?;
 
     let mut entries = Vec::new();
@@ -63,7 +63,7 @@ pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<
 
 pub fn create_sstable_with_kvs(
     mut kvs: Vec<(Key, Value)>,
-    opts: SsTableOpts,
+    opts: SsTableBuildOpts,
 ) -> TestResult<SsTableFixture> {
     let dir = tempdir().expect("create tmp dir");
     let tmp_sst = dir.path().join("tempdata.sst");
