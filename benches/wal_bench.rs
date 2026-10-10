@@ -22,8 +22,9 @@ fn wal_benchmark(c: &mut Criterion) {
                 let mut wal = FileWal::open(tmp.path(), mode).expect("failed to create WAL");
 
                 // Simple constant data
-                let key = Key::try_from(vec![0u8; MAX_TEST_KEY_LEN])?;
-                let value = Value::try_from(vec![b'x'; MAX_TEST_VAL_LEN])?;
+                let key = Key::try_from(vec![0u8; MAX_TEST_KEY_LEN]).expect("failed to create key");
+                let value =
+                    Value::try_from(vec![b'x'; MAX_TEST_VAL_LEN]).expect("failed to create value");
 
                 b.iter(|| {
                     wal.append(black_box(&key), black_box(&value))
