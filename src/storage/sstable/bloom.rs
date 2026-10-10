@@ -147,22 +147,6 @@ impl BloomFilterBuilder {
     }
 }
 
-/// Optimal bit array size (m) for the target false positive rate.
-fn optimal_bit_count(expected_num_items: u32, false_positive_rate: f64) -> usize {
-    let n = expected_num_items as f64;
-    let p = false_positive_rate;
-    let m = -(n * p.ln()) / (LN_2 * LN_2);
-    m.ceil() as usize
-}
-
-/// Optimal number of hash functions (k) given m and n.
-fn optimal_hash_count(bit_count: usize, expected_num_items: u32) -> u32 {
-    let m = bit_count as f64;
-    let n = expected_num_items as f64;
-    let k = (m / n) * LN_2;
-    k.round().max(1.0) as u32
-}
-
 #[cfg(test)]
 mod tests {
     use crate::testutils::{generate_rand_bytes, seeded_rng};
