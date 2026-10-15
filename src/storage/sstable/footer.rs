@@ -34,13 +34,20 @@ impl SsTableFooterTail {
             magic: FOOTER_MAGIC,
         }
     }
+
+    pub fn validate(&self) -> Result<(), SsTableError> {
+        if self.magic != FOOTER_MAGIC {
+            return ValidationSnafu {
+                reason: "invalid footer magic number",
+            }
+            .fail();
+        }
+        Ok(())
+    }
 }
 
 impl Codable for SsTableFooterTail {
-    type EncodeErr = SsTableError;
-    type DecodeErr = SsTableError;
-
-    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, Self::EncodeErr> {
+    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         writer.write_u16::<LittleEndian>(self.sst_version)?;
         writer.write_u64::<LittleEndian>(self.footer_size)?;
         writer.write_u64::<LittleEndian>(self.magic)?;
@@ -49,16 +56,10 @@ impl Codable for SsTableFooterTail {
             + size_of_val(&self.magic))
     }
 
-    fn decode(reader: &mut impl io::Read) -> Result<Self, Self::DecodeErr> {
+    fn decode(reader: &mut impl io::Read) -> Result<Self, io::Error> {
         let sst_version = reader.read_u16::<LittleEndian>()?;
         let footer_size = reader.read_u64::<LittleEndian>()?;
         let magic = reader.read_u64::<LittleEndian>()?;
-        if magic != FOOTER_MAGIC {
-            return ValidationSnafu {
-                reason: "invalid footer magic number",
-            }
-            .fail();
-        }
         Ok(Self {
             sst_version,
             footer_size,
@@ -71,39 +72,15 @@ impl Codable for SsTableFooterTail {
 // NB: If a new field is added to the footer, the FOOTER_SIZE constant must be
 // updated.
 pub struct SsTableFooter {
+    /// The filter must lay before all other sections in the footer.
     pub filter_offset: u64,
     pub filter_size: u32,
     pub index_offset: u64,
     pub index_size: u32,
 }
 
-impl SsTableFooter {
-    /// Returns the end offset of the data section. This is useful for
-    /// determining when a cursor has reached the end of the data section.
-    pub fn data_end(&self) -> u64 {
-        // The data section ends where the filter section begins, which is
-        // enforced by the validate() method.
-        self.filter_offset
-    }
-
-    /// Validates that the footer is well-formed.
-    fn validate(&self) -> Result<(), SsTableError> {
-        if self.filter_offset >= self.index_offset {
-            return ValidationSnafu {
-                reason: "filter should lay before all other metadata",
-            }
-            .fail();
-        }
-        Ok(())
-    }
-}
-
 impl Codable for SsTableFooter {
-    type EncodeErr = SsTableError;
-    type DecodeErr = SsTableError;
-
-    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, Self::EncodeErr> {
-        self.validate()?;
+    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         writer.write_u64::<LittleEndian>(self.filter_offset)?;
         writer.write_u32::<LittleEndian>(self.filter_size)?;
         writer.write_u64::<LittleEndian>(self.index_offset)?;
@@ -114,14 +91,13 @@ impl Codable for SsTableFooter {
             + size_of_val(&self.index_size))
     }
 
-    fn decode(reader: &mut impl io::Read) -> Result<Self, Self::DecodeErr> {
+    fn decode(reader: &mut impl io::Read) -> Result<Self, io::Error> {
         let ret = Self {
             filter_offset: reader.read_u64::<LittleEndian>()?,
             filter_size: reader.read_u32::<LittleEndian>()?,
             index_offset: reader.read_u64::<LittleEndian>()?,
             index_size: reader.read_u32::<LittleEndian>()?,
         };
-        ret.validate()?;
         Ok(ret)
     }
 }
@@ -140,7 +116,8 @@ mod tests {
             index_offset: 10,
             index_size: 10,
         }
-        .encode(&mut bytes)?;
+        .encode(&mut bytes)
+        .expect("failed to encode footer");
         assert_eq!(bytes.len(), FOOTER_SIZE);
         Ok(())
     }

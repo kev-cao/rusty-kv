@@ -50,17 +50,14 @@ impl AsRef<[u8]> for BloomFilter {
 }
 
 impl Codable for BloomFilter {
-    type EncodeErr = io::Error;
-    type DecodeErr = io::Error;
-
-    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, Self::EncodeErr> {
+    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         writer.write_u32::<LittleEndian>(self.bits.len() as u32)?;
         writer.write_u32::<LittleEndian>(self.num_hashes)?;
         writer.write_all(self.as_ref())?;
         Ok(size_of::<u32>() + size_of::<u32>() + self.bits.len())
     }
 
-    fn decode(reader: &mut impl io::Read) -> Result<Self, Self::DecodeErr> {
+    fn decode(reader: &mut impl io::Read) -> Result<Self, io::Error> {
         let size = reader.read_u32::<LittleEndian>()?;
         let num_hashes = reader.read_u32::<LittleEndian>()?;
         let mut bits = vec![0; size as usize];
@@ -98,16 +95,13 @@ impl Default for BloomFilterOpts {
 }
 
 impl Codable for BloomFilterOpts {
-    type EncodeErr = io::Error;
-    type DecodeErr = io::Error;
-
-    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, Self::EncodeErr> {
+    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         writer.write_u32::<LittleEndian>(self.filter_size)?;
         writer.write_u32::<LittleEndian>(self.num_hashes)?;
         Ok(size_of::<u32>() + size_of::<u32>())
     }
 
-    fn decode(reader: &mut impl io::Read) -> Result<Self, Self::DecodeErr> {
+    fn decode(reader: &mut impl io::Read) -> Result<Self, io::Error> {
         let filter_size = reader.read_u32::<LittleEndian>()?;
         let num_hashes = reader.read_u32::<LittleEndian>()?;
         Ok(Self {

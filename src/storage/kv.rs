@@ -78,16 +78,13 @@ impl AsRef<[u8]> for Key {
 }
 
 impl Codable for Key {
-    type EncodeErr = io::Error;
-    type DecodeErr = io::Error;
-
-    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, Self::EncodeErr> {
+    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         writer.write_u16::<LittleEndian>(self.len())?;
         writer.write_all(&self.0)?;
         Ok(size_of::<KeyLen>() + self.0.len())
     }
 
-    fn decode(reader: &mut impl io::Read) -> Result<Self, Self::DecodeErr> {
+    fn decode(reader: &mut impl io::Read) -> Result<Self, io::Error> {
         let key_len: KeyLen = reader.read_u16::<LittleEndian>()?;
         let mut key = Self(vec![0u8; key_len as usize]);
         reader.read_exact(&mut key.0)?;
@@ -169,16 +166,13 @@ impl AsRef<[u8]> for Value {
 }
 
 impl Codable for Value {
-    type EncodeErr = io::Error;
-    type DecodeErr = io::Error;
-
-    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, Self::EncodeErr> {
+    fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         writer.write_u32::<LittleEndian>(self.len())?;
         writer.write_all(&self.0)?;
         Ok(size_of::<ValueLen>() + self.0.len())
     }
 
-    fn decode(reader: &mut impl io::Read) -> Result<Self, Self::DecodeErr> {
+    fn decode(reader: &mut impl io::Read) -> Result<Self, io::Error> {
         let val_len: ValueLen = reader.read_u32::<LittleEndian>()?;
         let mut val = Self(vec![0u8; val_len as usize]);
         reader.read_exact(&mut val.0)?;

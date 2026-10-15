@@ -243,6 +243,7 @@ mod tests {
     use super::super::SsTableBuildOpts;
     use super::super::testutils::*;
     use super::*;
+    use crate::storage::sstable::block;
     use crate::testutils::{TestResult, key, value};
     use rstest::{fixture, rstest};
     use std::assert_matches;
@@ -261,7 +262,7 @@ mod tests {
         create_sstable_with_kvs(
             kvs,
             SsTableBuildOpts {
-                index_opts: index::SsTableIndexOpts { block_max_size: 48 },
+                block_opts: block::SsTableBlockBuilderOpts { max_size: 48 },
                 ..Default::default()
             },
         )
@@ -376,7 +377,11 @@ mod tests {
         }: SsTableFixture,
     ) -> TestResult<()> {
         let mut iter = sstable.kv_iter();
-        for _ in 0..2 {
+        // We need to fully iterate a block --- corrupting the file before the
+        // iterator has completely iterated a block means our `next` calls will
+        // continue to succeed until we move to the next block since the
+        // iterator reads from the block in memory.
+        for _ in 0..3 {
             assert!(iter.next()?);
         }
         // Corrupt the SSTable file to simulate an I/O error. In order to
@@ -404,7 +409,7 @@ mod tests {
         );
 
         iter.reset();
-        for (key, value) in entries.iter().take(2) {
+        for (key, value) in entries.iter().take(3) {
             assert!(iter.next()?);
             assert_eq!(iter.key()?, Some(key));
             assert_eq!(iter.value()?, Some(value));
