@@ -4,7 +4,6 @@ use std::io::{self};
 
 use crate::storage::encoding::Codable;
 use crate::storage::kv::Key;
-use crate::storage::sstable::block::SsTableBlock;
 
 pub struct SsTableIndexEntry {
     pub last_key: Key,
@@ -109,11 +108,11 @@ impl SsTableIndexBuilder {
 
     /// Adds a new block to the index. Last key refers to the last key in the
     /// block being added.
-    pub fn add_block(&mut self, block: &SsTableBlock, last_key: &Key) {
+    pub fn add_block(&mut self, block_size: u32, last_key: &Key) {
         let entry = SsTableIndexEntry {
             last_key: last_key.clone(),
             block_offset: self.current_offset,
-            block_size: block.block_size() as u32,
+            block_size,
         };
         self.current_offset += entry.block_size as u64;
         self.index.0.push(entry);
@@ -170,7 +169,10 @@ mod tests {
             // We'll have two keys per block.
             if i % 2 == 1 {
                 let block = block_builder.finish()?;
-                index_builder.add_block(&block, &k);
+                let block_size = block
+                    .encode(&mut io::sink())
+                    .expect("failed to encode block");
+                index_builder.add_block(block_size as u32, &k);
                 block_builder = SsTableBlockBuilder::new(Default::default());
             }
         }

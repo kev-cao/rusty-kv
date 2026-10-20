@@ -1,14 +1,13 @@
 use std::{
     borrow::Borrow,
-    io::{self, Seek, SeekFrom},
+    io::{self},
     os::unix::fs::FileExt,
 };
 
 use super::index;
-use crate::storage::sstable::SsTable;
+use crate::storage::sstable::{SsTable, SsTableError, block};
 use crate::storage::{
     collections::KVIterator,
-    encoding::Codable,
     kv::{Key, Value},
 };
 use snafu::prelude::*;
@@ -18,6 +17,11 @@ pub enum SsTableIteratorError {
     #[snafu(context(false), display("SSTable io operation failed"))]
     IoError {
         source: io::Error,
+        backtrace: snafu::Backtrace,
+    },
+    #[snafu(context(false), display("SSTable error: {source}"))]
+    SsTableError {
+        source: SsTableError,
         backtrace: snafu::Backtrace,
     },
     #[snafu(display("SSTable iterator is poisoned, reset or re-seek required"))]
@@ -46,14 +50,20 @@ pub struct SsTableIterator<'a> {
     sstable: &'a SsTable,
     key: Option<Key>,
     value: Option<Value>,
-    curr_block: Option<CurrentBlock<'a>>,
+    block_iter: Option<BlockIter<'a>>,
     state: SsTableIteratorState,
 }
 
-struct CurrentBlock<'a> {
+struct BlockIter<'a> {
     entry: &'a index::SsTableIndexEntry,
     entry_index: usize,
-    cursor: io::Cursor<Vec<u8>>,
+    block: block::SsTableBlock,
+    /// Restart index represents the index of the restart point that the cursor
+    /// is currently at. When a cursor is at the beginning of a block and has
+    /// yet to visit the first key, the restart index is -1.
+    restart_index: i64,
+    key_prefix: Option<Key>,
+    offset: usize,
 }
 
 impl<'a> SsTableIterator<'a> {
@@ -61,7 +71,7 @@ impl<'a> SsTableIterator<'a> {
         Self {
             key: None,
             value: None,
-            curr_block: None,
+            block_iter: None,
             state: SsTableIteratorState::Valid,
             sstable,
         }
@@ -72,7 +82,7 @@ impl<'a> SsTableIterator<'a> {
         self.key = None;
         self.value = None;
         self.state = SsTableIteratorState::Valid;
-        self.curr_block = None;
+        self.block_iter = None;
     }
 
     /// Loads the block at the given index into the iterator. Returns true if the
@@ -82,27 +92,25 @@ impl<'a> SsTableIterator<'a> {
             self.state = SsTableIteratorState::Exhausted;
             return Ok(false);
         };
-        let block = match &mut self.curr_block {
-            Some(block) => block,
-            None => {
-                self.curr_block = Some(CurrentBlock {
-                    entry,
-                    entry_index: n,
-                    cursor: io::Cursor::new(vec![0; entry.block_size as usize]),
-                });
-                self.curr_block.as_mut().unwrap()
-            }
-        };
-        block.entry_index = n;
-        block.entry = entry;
-        block.cursor.set_position(0);
-        block.cursor.get_mut().resize(entry.block_size as usize, 0);
+
+        let mut block_data = vec![0; entry.block_size as usize];
         self.sstable
             .file
-            .read_exact_at(block.cursor.get_mut(), entry.block_offset)
+            .read_exact_at(block_data.as_mut_slice(), entry.block_offset)
             .inspect_err(|_| {
-                self.curr_block = None;
+                self.block_iter = None;
             })?;
+        self.block_iter = Some(BlockIter {
+            entry,
+            entry_index: n,
+            key_prefix: None,
+            block: block::SsTableBlock::decode(
+                &mut block_data.as_slice(),
+                entry.block_size as usize,
+            )?,
+            restart_index: -1,
+            offset: 0,
+        });
         Ok(true)
     }
 
@@ -116,29 +124,47 @@ impl<'a> SsTableIterator<'a> {
             }
             _ => {}
         };
-
-        let mut curr_block = match &mut self.curr_block {
+        let mut block_iter = match &mut self.block_iter {
             Some(block) => block,
             None => {
                 if !self.load_block_n(0)? {
                     self.set_exhausted();
                     return Ok(false);
                 }
-                self.curr_block.as_mut().unwrap()
+                self.block_iter.as_mut().unwrap()
             }
         };
-        if curr_block.cursor.position() >= curr_block.cursor.get_ref().len() as u64 {
-            let next_idx = curr_block.entry_index + 1;
+        if block_iter.offset >= block_iter.block.data.len() {
+            let next_idx = block_iter.entry_index + 1;
             if !self.load_block_n(next_idx)? {
                 self.set_exhausted();
                 return Ok(false);
             }
-            curr_block = self.curr_block.as_mut().unwrap();
+            block_iter = self.block_iter.as_mut().unwrap();
         }
-        let next_key = Some(Key::decode(&mut curr_block.cursor)?);
-        let next_value = Some(Value::decode(&mut curr_block.cursor)?);
-        self.key = next_key;
-        self.value = next_value;
+        let curr_restart_idx = block_iter.restart_index;
+        if curr_restart_idx < block_iter.block.restart_array.len() as i64 - 1
+            && block_iter.offset
+                == block_iter.block.restart_array[(curr_restart_idx + 1) as usize] as usize
+        {
+            // The offset has reached the next restart point, so update the
+            // index and decode the key-value pair with no prefix.
+            let (key, value, bytes_read) =
+                block::decode_kv_pair(&mut &block_iter.block.data[block_iter.offset..], None)?;
+            block_iter.offset += bytes_read;
+            block_iter.key_prefix = Some(key.clone());
+            block_iter.restart_index += 1;
+            self.key = Some(key);
+            self.value = Some(value);
+        } else {
+            let (key, value, bytes_read) = block::decode_kv_pair(
+                &mut &block_iter.block.data[block_iter.offset..],
+                block_iter.key_prefix.as_ref(),
+            )?;
+            block_iter.offset += bytes_read;
+            self.key = Some(key);
+            self.value = Some(value);
+        }
         Ok(true)
     }
 
@@ -152,7 +178,7 @@ impl<'a> SsTableIterator<'a> {
             self.set_exhausted();
             return Ok(false);
         };
-        if let Some(curr_block) = &self.curr_block
+        if let Some(curr_block) = &self.block_iter
             && curr_block.entry_index == entry_index
         {
             // We are already in the correct block, just seek within it.
@@ -171,26 +197,52 @@ impl<'a> SsTableIterator<'a> {
         Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let Some(curr_block) = &mut self.curr_block else {
+        let Some(block_iter) = &mut self.block_iter else {
             whatever!("unexpectedly called seek_ge_in_block with no current block loaded");
         };
-        curr_block.cursor.set_position(0);
-        let mut curr_key = Key::decode(&mut curr_block.cursor)?;
-        while curr_key.borrow() < key {
-            let value_len = Value::decode_len(&mut curr_block.cursor)?;
-            curr_block
-                .cursor
-                .seek(SeekFrom::Current(value_len.into()))?;
-            if curr_block.cursor.position() >= curr_block.entry.block_size.into() {
-                // This technically shouldn't happen, as the index should have
-                // pointed us to a block whose last key is >= the seek key.
-                whatever!("seek_ge_in_block reached end of block without finding key >= seek key");
+        let mut search_err = None;
+        let search_result = block_iter.block.restart_array.binary_search_by(|offset| {
+            match block::decode_key(&mut &block_iter.block.data[*offset as usize..], None) {
+                Ok((restart_key, _, _)) => restart_key.borrow().cmp(key),
+                Err(e) => {
+                    search_err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
             }
-            curr_key = Key::decode(&mut curr_block.cursor)?;
+        });
+        if let Some(e) = search_err {
+            return Err(e.into());
         }
-        self.value = Some(Value::decode(&mut curr_block.cursor)?);
-        self.key = Some(curr_key);
-        Ok(())
+        // We set the restart index to the index *prior* of the restart interval
+        // we wish to seek within, so that we can just re-use the `next_inner()`
+        // logic. Setting to the prior index positions us at the start of the
+        // restart interval.
+        match search_result {
+            Ok(restart_idx) => {
+                block_iter.restart_index = restart_idx as i64 - 1;
+                block_iter.offset = block_iter.block.restart_array[restart_idx] as usize;
+            }
+            Err(restart_idx) => {
+                if restart_idx == 0 {
+                    block_iter.restart_index = -1;
+                    block_iter.offset = 0;
+                } else {
+                    block_iter.restart_index = restart_idx as i64 - 2;
+                    block_iter.offset = block_iter.block.restart_array[restart_idx - 1] as usize;
+                }
+            }
+        };
+        while self.next_inner()? {
+            let Some(curr_key) = &self.key else {
+                whatever!("next_inner returned true but key is None");
+            };
+            if curr_key.borrow() >= key {
+                return Ok(());
+            }
+        }
+        // This technically shouldn't happen, as the index should have
+        // pointed us to a block whose last key is >= the seek key.
+        whatever!("seek_ge_in_block reached end of block without finding key >= seek key");
     }
 
     fn set_exhausted(&mut self) {
@@ -248,43 +300,34 @@ mod tests {
     use rstest::{fixture, rstest};
     use std::assert_matches;
 
-    #[fixture]
-    fn static_sstable() -> SsTableFixture {
-        let kvs = vec![
-            (key(b"apple"), value(b"fruit")),
-            (key(b"banana"), value(b"fruit")),
-            (key(b"cabbage"), value(b"vegetable")),
-            (key(b"carrot"), value(b"vegetable")),
-            (key(b"durian"), value(b"fruit")),
-        ];
-        // We artificially lower the block size to force multiple blocks to be
-        // created for the test data.
-        create_sstable_with_kvs(
-            kvs,
-            SsTableBuildOpts {
-                block_opts: block::SsTableBlockBuilderOpts { max_size: 48 },
-                ..Default::default()
-            },
-        )
-        .expect("failed to create static SSTable fixture")
-    }
-
     #[rstest]
     #[case::seek_to_existing_key(key(b"banana"), Some(key(b"banana")))]
     #[case::seek_to_before_key(key(b"bad apple"), Some(key(b"banana")))]
     #[case::seek_to_first_key(key(b"apple"), Some(key(b"apple")))]
     #[case::seek_to_before_first_key(key(b"acerola"), Some(key(b"apple")))]
-    #[case::seek_to_after_last_key(key(b"dwarf mulberry"), None)]
+    #[case::seek_to_last_key(key(b"xray"), Some(key(b"xray")))]
+    #[case::seek_to_after_last_key(key(b"zebra"), None)]
     fn seek_ge(
-        #[from(static_sstable)] SsTableFixture {
-            sstable,
-            dir: _,
-            filepath: _,
-            entries: _,
-        }: SsTableFixture,
+        default_kvs: Vec<(Key, Value)>,
+        #[values(
+            normal_block_opts(),
+            small_block_opts(),
+            large_block_opts(),
+            massive_block_opts(),
+            small_restart_opts(),
+            large_restart_opts(),
+            massive_block_and_restart_opts()
+        )]
+        opts: SsTableBuildOpts,
         #[case] seek_key: Key,
         #[case] expected_key: Option<Key>,
     ) -> TestResult<()> {
+        let SsTableFixture {
+            sstable,
+            dir: _dir,
+            filepath: _,
+            entries: _,
+        } = create_sstable_with_kvs(default_kvs, opts)?;
         let mut iter = sstable.kv_iter();
         let found = iter.seek_ge(&seek_key)?;
         if let Some(expected_key) = expected_key {
@@ -299,13 +342,24 @@ mod tests {
 
     #[rstest]
     fn next(
-        #[from(static_sstable)] SsTableFixture {
+        default_kvs: Vec<(Key, Value)>,
+        #[values(
+            normal_block_opts(),
+            small_block_opts(),
+            large_block_opts(),
+            massive_block_opts(),
+            small_restart_opts(),
+            large_restart_opts(),
+            massive_block_and_restart_opts()
+        )]
+        opts: SsTableBuildOpts,
+    ) -> TestResult<()> {
+        let SsTableFixture {
             sstable,
             entries,
-            dir: _,
+            dir: _dir,
             filepath: _,
-        }: SsTableFixture,
-    ) -> TestResult<()> {
+        } = create_sstable_with_kvs(default_kvs, opts)?;
         let mut iter = sstable.kv_iter();
         for (expected_key, expected_value) in entries {
             let has_next = iter.next()?;
@@ -318,16 +372,27 @@ mod tests {
     }
 
     #[rstest]
-    #[case::seek_to_first_key(key(b"apple"), Some(key(b"banana")))]
-    #[case::seek_before_first_key(key(b"acerola"), Some(key(b"banana")))]
-    #[case::seek_to_second_to_last_key(key(b"carrot"), Some(key(b"durian")))]
-    #[case::seek_to_before_last_key(key(b"date"), None)]
-    #[case::seek_to_last_key(key(b"durian"), None)]
+    #[case::seek_to_first_key(key(b"apple"), Some(key(b"application")))]
+    #[case::seek_before_first_key(key(b"acerola"), Some(key(b"application")))]
+    #[case::seek_to_second_to_last_key(key(b"transcription"), Some(key(b"xray")))]
+    #[case::seek_to_before_last_key(key(b"xenon"), None)]
+    #[case::seek_to_last_key(key(b"xray"), None)]
     fn seek_ge_next(
-        static_sstable: SsTableFixture,
+        default_kvs: Vec<(Key, Value)>,
+        #[values(
+            normal_block_opts(),
+            small_block_opts(),
+            large_block_opts(),
+            massive_block_opts(),
+            small_restart_opts(),
+            large_restart_opts(),
+            massive_block_and_restart_opts()
+        )]
+        opts: SsTableBuildOpts,
         #[case] seek_key: Key,
         #[case] next_key: Option<Key>,
     ) -> TestResult<()> {
+        let static_sstable = create_sstable_with_kvs(default_kvs, opts)?;
         let mut iter = static_sstable.sstable.kv_iter();
         let found = iter.seek_ge(&seek_key)?;
         assert!(found, "test assumes seek_ge should find a key");
@@ -345,13 +410,15 @@ mod tests {
 
     #[rstest]
     fn reset(
-        #[from(static_sstable)] SsTableFixture {
+        default_kvs: Vec<(Key, Value)>,
+        #[values(normal_block_opts())] opts: SsTableBuildOpts,
+    ) -> TestResult<()> {
+        let SsTableFixture {
             sstable,
             entries,
-            dir: _,
+            dir: _dir,
             filepath: _,
-        }: SsTableFixture,
-    ) -> TestResult<()> {
+        } = create_sstable_with_kvs(default_kvs, opts)?;
         let mut iter = sstable.kv_iter();
         for _ in 0..entries.len() {
             assert!(iter.next()?);
@@ -368,63 +435,181 @@ mod tests {
     }
 
     #[rstest]
-    fn poisoned_iter(
-        #[from(static_sstable)] SsTableFixture {
+    fn poisoned_iter(default_kvs: Vec<(Key, Value)>) -> TestResult<()> {
+        let SsTableFixture {
             sstable,
+            dir: _dir,
             filepath,
-            entries,
-            dir: _,
-        }: SsTableFixture,
-    ) -> TestResult<()> {
+            entries: _,
+        } = create_sstable_with_kvs(default_kvs, normal_block_opts())?;
         let mut iter = sstable.kv_iter();
-        // We need to fully iterate a block --- corrupting the file before the
-        // iterator has completely iterated a block means our `next` calls will
-        // continue to succeed until we move to the next block since the
-        // iterator reads from the block in memory.
-        for _ in 0..3 {
-            assert!(iter.next()?);
-        }
-        // Corrupt the SSTable file to simulate an I/O error. In order to
-        // validate that the iterator works after poisoning and resetting, we'll
-        // only corrupt the file at the point where the iterator is currently
-        // positioned.
+        // We corrupt the *second* block in the table, to ensure that we can
+        // still iterate the first block successfully and only fail when we
+        // attempt to read the second block. This allows us to validate that
+        // resetting allows you to read the non-corrupted block.
         let file = std::fs::OpenOptions::new()
             .write(true)
             .read(true)
             .open(&filepath)
             .expect("failed to open SSTable file");
-        let curr_block = iter
-            .curr_block
-            .as_ref()
-            .expect("iterator should have a current block");
-        let current_pos = curr_block.entry.block_offset + curr_block.cursor.position();
-        file.write_at(&[0xFF; 64], current_pos)
+        let next_block = sstable
+            .index
+            .0
+            .get(1)
+            .expect("at least two blocks should exist");
+        file.write_at(&[0xFF; 64], next_block.block_offset)
             .expect("failed to corrupt SSTable file");
 
-        assert!(iter.next().is_err());
-        assert_matches!(
-            iter.next()
-                .expect_err("expected poisoned iterator to return an error"),
-            SsTableIteratorError::IteratorPoisoned { .. },
-        );
+        // Since we corrupted the second block, we expect to be able to iterate
+        // the first block successfully and then encounter an error on the
+        // second when using a clean iterator.
+        let verify_success_iter_and_fail = |iter: &mut SsTableIterator| {
+            let mut success_iters = 0;
+            let terminating_result = loop {
+                let res = iter.next();
+                if !res.as_ref().is_ok_and(|has_next| *has_next) {
+                    break res;
+                } else {
+                    success_iters += 1;
+                }
+            };
+            assert!(
+                success_iters > 0,
+                "expected to successfully iterate at least one key-value pair before encountering an error"
+            );
+            assert!(
+                terminating_result.is_err(),
+                "expect iteration to stop due to an error when reading the corrupted block"
+            );
+            assert_matches!(
+                iter.next()
+                    .expect_err("expected poisoned iterator to return an error"),
+                SsTableIteratorError::IteratorPoisoned { .. },
+            );
+        };
 
+        verify_success_iter_and_fail(&mut iter);
         iter.reset();
-        for (key, value) in entries.iter().take(3) {
-            assert!(iter.next()?);
-            assert_eq!(iter.key()?, Some(key));
-            assert_eq!(iter.value()?, Some(value));
-        }
-
-        assert!(iter.next().is_err());
-        assert_matches!(
-            iter.next()
-                .expect_err("expected poisoned iterator to return an error"),
-            SsTableIteratorError::IteratorPoisoned { .. }
-        );
+        verify_success_iter_and_fail(&mut iter);
 
         // Using a seek instead of reset after poisoning should also work.
         iter.seek_ge(&key(b"apple"))?;
         assert_eq!(iter.key()?, Some(&key(b"apple")));
         Ok(())
+    }
+
+    // Defines a set of block configs for the tests that want coverage over
+    // different SSTable block shapes. For the purposes of the tests, we'll
+    // assume that a block size of 128 bytes and a restart interval of 6 is
+    // considered "normal" since the tests are using a small number of keys and
+    // values.
+    fn normal_block_opts() -> SsTableBuildOpts {
+        SsTableBuildOpts {
+            block_opts: block::SsTableBlockBuilderOpts {
+                max_size: 128,
+                restart_interval: 6,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn small_block_opts() -> SsTableBuildOpts {
+        SsTableBuildOpts {
+            block_opts: block::SsTableBlockBuilderOpts {
+                max_size: 32,
+                restart_interval: 6,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn large_block_opts() -> SsTableBuildOpts {
+        SsTableBuildOpts {
+            block_opts: block::SsTableBlockBuilderOpts {
+                max_size: 256,
+                restart_interval: 6,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn massive_block_opts() -> SsTableBuildOpts {
+        SsTableBuildOpts {
+            block_opts: block::SsTableBlockBuilderOpts {
+                max_size: 1024,
+                restart_interval: 6,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn small_restart_opts() -> SsTableBuildOpts {
+        SsTableBuildOpts {
+            block_opts: block::SsTableBlockBuilderOpts {
+                max_size: 128,
+                restart_interval: 2,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn large_restart_opts() -> SsTableBuildOpts {
+        SsTableBuildOpts {
+            block_opts: block::SsTableBlockBuilderOpts {
+                max_size: 128,
+                restart_interval: 12,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Large enough to store all of the test keys and values in a single block,
+    /// with a single restart point.
+    fn massive_block_and_restart_opts() -> SsTableBuildOpts {
+        SsTableBuildOpts {
+            block_opts: block::SsTableBlockBuilderOpts {
+                max_size: 1024,
+                restart_interval: 32,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[fixture]
+    fn default_kvs() -> Vec<(Key, Value)> {
+        vec![
+            (key(b"apple"), value(b"noun")),
+            (key(b"application"), value(b"noun")),
+            (key(b"apply"), value(b"verb")),
+            (key(b"appraise"), value(b"verb")),
+            (key(b"apprentice"), value(b"noun")),
+            (key(b"approximate"), value(b"adjective")),
+            (key(b"banana"), value(b"noun")),
+            (key(b"bandana"), value(b"noun")),
+            (key(b"cabbage"), value(b"noun")),
+            (key(b"carry"), value(b"verb")),
+            (key(b"cloudy"), value(b"adjective")),
+            (key(b"exceptional"), value(b"adjective")),
+            (key(b"floccinaucinihilipilification"), value(b"noun")),
+            (key(b"floccipend"), value(b"verb")),
+            (key(b"graph"), value(b"noun")),
+            (key(b"graphical"), value(b"adjective")),
+            (key(b"graphite"), value(b"noun")),
+            (key(b"grappling"), value(b"noun")),
+            (key(b"grateful"), value(b"adjective")),
+            (key(b"gravity"), value(b"noun")),
+            (key(b"harbor"), value(b"noun")),
+            (key(b"harmonious"), value(b"adjective")),
+            (key(b"harmonize"), value(b"verb")),
+            (key(b"harpoon"), value(b"noun")),
+            (key(b"helicopter"), value(b"noun")),
+            (key(b"knowledge"), value(b"noun")),
+            (key(b"transact"), value(b"verb")),
+            (key(b"transaction"), value(b"noun")),
+            (key(b"transactional"), value(b"adjective")),
+            (key(b"transcribe"), value(b"verb")),
+            (key(b"transcription"), value(b"noun")),
+            (key(b"xray"), value(b"noun")),
+        ]
     }
 }

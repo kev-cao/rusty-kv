@@ -19,7 +19,7 @@ pub enum KeyError {
 }
 
 #[derive(Default, PartialEq, Eq, PartialOrd, Ord, Clone)]
-pub struct Key(Vec<u8>);
+pub struct Key(pub Vec<u8>);
 
 impl Key {
     pub fn len(&self) -> KeyLen {
@@ -101,7 +101,7 @@ pub enum ValueError {
 }
 
 #[derive(PartialEq, Clone)]
-pub struct Value(Vec<u8>);
+pub struct Value(pub Vec<u8>);
 
 impl Value {
     pub fn len(&self) -> ValueLen {

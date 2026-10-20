@@ -31,8 +31,13 @@ pub enum SsTableError {
         source: io::Error,
         backtrace: snafu::Backtrace,
     },
-    #[snafu(display("SSTableFooter validation failed: {reason}"))]
+    #[snafu(display("{reason}"))]
     ValidationError {
+        reason: String,
+        backtrace: snafu::Backtrace,
+    },
+    #[snafu(display("{reason}"))]
+    CorruptionError {
         reason: String,
         backtrace: snafu::Backtrace,
     },
@@ -120,7 +125,6 @@ pub enum SsTableBuilderError {
 }
 
 pub struct SsTableBuilder {
-    path: PathBuf,
     writer: io::BufWriter<fs::File>,
     filter_offset: u64,
     filter: bloom::BloomFilterBuilder,
@@ -136,7 +140,6 @@ impl SsTableBuilder {
         opts: SsTableBuildOpts,
     ) -> Result<Self, SsTableBuilderError> {
         Ok(Self {
-            path: path.as_ref().to_path_buf(),
             writer: io::BufWriter::new(
                 fs::OpenOptions::new()
                     .write(true)
@@ -198,7 +201,7 @@ impl SsTableBuilder {
         let block = builder.finish()?;
         let written = block.encode(&mut self.writer)?;
         self.filter_offset += written as u64;
-        self.index.add_block(&block, last_key);
+        self.index.add_block(written as u32, last_key);
         Ok(())
     }
 }
