@@ -1,4 +1,3 @@
-use std::f64::consts::LN_2;
 use std::io;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
