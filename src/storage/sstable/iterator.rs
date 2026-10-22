@@ -457,6 +457,7 @@ mod tests {
         #[values(
             normal_block_opts(),
             small_block_opts(),
+            tiny_block_opts(),
             large_block_opts(),
             massive_block_opts(),
             small_restart_opts(),
@@ -491,6 +492,7 @@ mod tests {
         #[values(
             normal_block_opts(),
             small_block_opts(),
+            tiny_block_opts(),
             large_block_opts(),
             massive_block_opts(),
             small_restart_opts(),
@@ -527,6 +529,7 @@ mod tests {
         #[values(
             normal_block_opts(),
             small_block_opts(),
+            tiny_block_opts(),
             large_block_opts(),
             massive_block_opts(),
             small_restart_opts(),
@@ -565,6 +568,7 @@ mod tests {
         #[values(
             normal_block_opts(),
             small_block_opts(),
+            tiny_block_opts(),
             large_block_opts(),
             massive_block_opts(),
             small_restart_opts(),
@@ -601,6 +605,7 @@ mod tests {
         default_kvs: Vec<(Key, Value)>,
         #[values(
             normal_block_opts(),
+            tiny_block_opts(),
             small_block_opts(),
             large_block_opts(),
             massive_block_opts(),
@@ -742,6 +747,17 @@ mod tests {
         SsTableBuildOpts {
             block_opts: block::SsTableBlockBuilderOpts {
                 max_size: 32,
+                restart_interval: 6,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Tiny block size to force each key/value into its own block.
+    fn tiny_block_opts() -> SsTableBuildOpts {
+        SsTableBuildOpts {
+            block_opts: block::SsTableBlockBuilderOpts {
+                max_size: 8,
                 restart_interval: 6,
             },
             ..Default::default()
