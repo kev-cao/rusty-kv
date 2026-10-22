@@ -242,7 +242,150 @@ impl<'a> SsTableIterator<'a> {
         }
         // This technically shouldn't happen, as the index should have
         // pointed us to a block whose last key is >= the seek key.
-        whatever!("seek_ge_in_block reached end of block without finding key >= seek key");
+        whatever!(
+            "seek_ge_in_block impossibly reached end of block without finding key >= seek key"
+        );
+    }
+
+    fn seek_lt_inner<Q>(&mut self, key: &Q) -> Result<bool, SsTableIteratorError>
+    where
+        Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.state = SsTableIteratorState::Valid;
+        // Let there be two adjacent blocks with last keys α and β, where α < β,
+        // called b-α and b-β. Assume b-α and b-β are potential candidates for
+        // containing the search query ε.
+        //
+        // There are three cases to consider:
+        // 1. ε < α < β
+        //  - In this case, we should seek in b-α.
+        // 2. α < ε < β
+        //  - In this case, we should seek in b-β, but if we are unable to
+        //    find a satisfactory key < ε, we return the last key in b-α.
+        // 3. α < β < ε
+        //  - We should return the last key in b-β.
+        //
+        // Since our index lookup returns the block the key should be in, then
+        // the returned index is always that of b-β.
+        let Some((_, beta_entry_idx)) = self.sstable.index.key_block(key) else {
+            // The key lasts beyond the last key in the index, so case 3.
+            let last_block_idx = self.sstable.index.0.len() - 1;
+            if !self.load_block_n(last_block_idx)? {
+                whatever!("should not happen, as we should have picked a valid block to load");
+            }
+            self.seek_last_key_in_block()?;
+            return Ok(true);
+        };
+        if !self.load_block_n(beta_entry_idx)? {
+            whatever!("should not happen, as we should have picked a valid block to load");
+        }
+        if self.seek_lt_in_block(key)? {
+            return Ok(true);
+        }
+        if beta_entry_idx == 0 {
+            // We are already at the first block, so there is no previous block to
+            // seek in.
+            self.set_exhausted();
+            return Ok(false);
+        }
+        if !self.load_block_n(beta_entry_idx - 1)? {
+            return Ok(false);
+        }
+        self.seek_last_key_in_block()?;
+        Ok(true)
+    }
+
+    fn seek_lt_in_block<Q>(&mut self, key: &Q) -> Result<bool, SsTableIteratorError>
+    where
+        Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let Some(block_iter) = &mut self.block_iter else {
+            whatever!("unexpectedly called seek_lt_in_block with no current block loaded");
+        };
+        let mut search_err = None;
+        let search_result = block_iter.block.restart_array.binary_search_by(|offset| {
+            match block::decode_key(&mut &block_iter.block.data[*offset as usize..], None) {
+                Ok((restart_key, _, _)) => restart_key.borrow().cmp(key),
+                Err(e) => {
+                    search_err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = search_err {
+            return Err(e.into());
+        }
+        // Let i be the index i of some restart interval [α, β). For a given
+        // search key ε, the following cases are possible:
+        // 1. binary_search -> Ok(i)
+        //  - ε = α, so we should seek to the last key in the previous restart
+        //  interval.
+        // 2. binary_search -> Err(i)
+        //  - ε < α, so we should still seek within the previous restart
+        //  interval.
+        let search_restart_idx = match search_result {
+            Ok(i) => i as i64,
+            Err(i) => i as i64,
+        } - 1;
+        if search_restart_idx < 0 {
+            return Ok(false);
+        }
+        block_iter.restart_index = search_restart_idx;
+        block_iter.offset = block_iter.block.restart_array[search_restart_idx as usize] as usize;
+
+        let interval_end = if search_restart_idx + 1 < block_iter.block.restart_array.len() as i64 {
+            block_iter.block.restart_array[(search_restart_idx + 1) as usize] as usize
+        } else {
+            block_iter.block.data.len()
+        };
+        while block_iter.offset < interval_end {
+            let (curr_key, value, bytes_read) = block::decode_kv_pair(
+                &mut &block_iter.block.data[block_iter.offset..],
+                block_iter.key_prefix.as_ref(),
+            )?;
+            if block_iter.key_prefix.is_none() {
+                block_iter.key_prefix = Some(curr_key.clone());
+            }
+            if curr_key.borrow() >= key {
+                if block_iter.offset == 0 {
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+            block_iter.offset += bytes_read;
+            self.key = Some(curr_key);
+            self.value = Some(value);
+        }
+        // Reached the end of the restart interval without finding a key >= ε,
+        // so the last key in the interval is the largest key < ε.
+        Ok(true)
+    }
+
+    /// Seeks until the iterator is positioned at the last key in the current
+    /// block.
+    fn seek_last_key_in_block(&mut self) -> Result<(), SsTableIteratorError> {
+        let Some(block_iter) = &mut self.block_iter else {
+            whatever!("unexpectedly called last_key_in_block with no current block loaded");
+        };
+        block_iter.restart_index = block_iter.block.restart_array.len() as i64 - 1;
+        block_iter.offset =
+            block_iter.block.restart_array[block_iter.restart_index as usize] as usize;
+        block_iter.key_prefix = None;
+        while block_iter.offset < block_iter.block.data.len() {
+            let (key, value, bytes_read) = block::decode_kv_pair(
+                &mut &block_iter.block.data[block_iter.offset..],
+                block_iter.key_prefix.as_ref(),
+            )?;
+            if block_iter.key_prefix.is_none() {
+                block_iter.key_prefix = Some(key.clone());
+            }
+            block_iter.offset += bytes_read;
+            self.key = Some(key);
+            self.value = Some(value);
+        }
+        Ok(())
     }
 
     fn set_exhausted(&mut self) {
@@ -286,7 +429,9 @@ impl<'a> KVIterator for SsTableIterator<'a> {
         Self::Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        unimplemented!()
+        self.seek_lt_inner(key).inspect_err(|_| {
+            self.state = SsTableIteratorState::Poisoned;
+        })
     }
 }
 
@@ -409,6 +554,82 @@ mod tests {
     }
 
     #[rstest]
+    #[case::seek_to_existing_key(key(b"floccipend"), Some(key(b"floccinaucinihilipilification")))]
+    #[case::seek_to_between_keys(key(b"axe"), Some(key(b"approximate")))]
+    #[case::seek_to_first_key(key(b"apple"), None)]
+    #[case::seek_to_before_first_key(key(b"acerola"), None)]
+    #[case::seek_to_last_key(key(b"xray"), Some(key(b"transcription")))]
+    #[case::seek_to_after_last_key(key(b"zebra"), Some(key(b"xray")))]
+    fn seek_lt(
+        default_kvs: Vec<(Key, Value)>,
+        #[values(
+            normal_block_opts(),
+            small_block_opts(),
+            large_block_opts(),
+            massive_block_opts(),
+            small_restart_opts(),
+            large_restart_opts(),
+            massive_block_and_restart_opts()
+        )]
+        opts: SsTableBuildOpts,
+        #[case] seek_key: Key,
+        #[case] expected_key: Option<Key>,
+    ) -> TestResult<()> {
+        let SsTableFixture {
+            sstable,
+            dir: _dir,
+            filepath: _,
+            entries: _,
+        } = create_sstable_with_kvs(default_kvs, opts)?;
+        let mut iter = sstable.kv_iter();
+        let found = iter.seek_lt(&seek_key)?;
+        if let Some(expected_key) = expected_key {
+            assert!(found);
+            assert_eq!(iter.key()?, Some(&expected_key));
+        } else {
+            assert!(!found);
+            assert_eq!(iter.key()?, None);
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::seek_to_existing_key(key(b"floccipend"), Some(key(b"floccipend")))]
+    #[case::seek_to_second_key(key(b"application"), Some(key(b"application")))]
+    #[case::seek_to_between_keys(key(b"axe"), Some(key(b"banana")))]
+    fn seek_lt_next(
+        default_kvs: Vec<(Key, Value)>,
+        #[values(
+            normal_block_opts(),
+            small_block_opts(),
+            large_block_opts(),
+            massive_block_opts(),
+            small_restart_opts(),
+            large_restart_opts(),
+            massive_block_and_restart_opts()
+        )]
+        opts: SsTableBuildOpts,
+        #[case] seek_key: Key,
+        #[case] expected_key: Option<Key>,
+    ) -> TestResult<()> {
+        let fixture = create_sstable_with_kvs(default_kvs, opts)?;
+        let mut iter = fixture.sstable.kv_iter();
+        let found = iter.seek_lt(&seek_key)?;
+        let has_next = iter.next()?;
+        if let Some(expected_key) = expected_key {
+            assert!(found);
+            assert!(has_next);
+            assert_eq!(iter.key()?, Some(&expected_key));
+            assert_eq!(iter.value()?, fixture.get_value(&expected_key));
+        } else {
+            assert!(!found);
+            assert!(!has_next);
+            assert_eq!(iter.key()?, None);
+        }
+        Ok(())
+    }
+
+    #[rstest]
     fn reset(
         default_kvs: Vec<(Key, Value)>,
         #[values(normal_block_opts())] opts: SsTableBuildOpts,
@@ -492,8 +713,12 @@ mod tests {
         iter.reset();
         verify_success_iter_and_fail(&mut iter);
 
-        // Using a seek instead of reset after poisoning should also work.
+        // Using either seek instead of reset after poisoning should also work.
         iter.seek_ge(&key(b"apple"))?;
+        assert_eq!(iter.key()?, Some(&key(b"apple")));
+
+        verify_success_iter_and_fail(&mut iter);
+        iter.seek_lt(&key(b"application"))?;
         assert_eq!(iter.key()?, Some(&key(b"apple")));
         Ok(())
     }
