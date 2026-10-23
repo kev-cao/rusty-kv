@@ -17,7 +17,7 @@ const FOOTER_MAGIC: u64 = 0xdeadcafedeadcafe;
 /// The footer tail is a small structure that is written at the end of an SSTable
 /// file. To preserve backward compatibility, the footer tail size must always
 /// remain static.
-pub struct SsTableFooterTail {
+pub struct FooterTail {
     pub sst_version: u16,
     /// The length of the footer metadata section, in bytes. This is used to read
     /// the footer from the end of a file. This length does includes the length
@@ -26,7 +26,7 @@ pub struct SsTableFooterTail {
     pub magic: u64,
 }
 
-impl SsTableFooterTail {
+impl FooterTail {
     pub fn new() -> Self {
         Self {
             sst_version: SST_VERSION,
@@ -46,7 +46,7 @@ impl SsTableFooterTail {
     }
 }
 
-impl Codable for SsTableFooterTail {
+impl Codable for FooterTail {
     fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         writer.write_u16::<LittleEndian>(self.sst_version)?;
         writer.write_u64::<LittleEndian>(self.footer_size)?;
@@ -71,7 +71,7 @@ impl Codable for SsTableFooterTail {
 #[derive(Debug)]
 // NB: If a new field is added to the footer, the FOOTER_SIZE constant must be
 // updated.
-pub struct SsTableFooter {
+pub struct Footer {
     /// The filter must lay before all other sections in the footer.
     pub filter_offset: u64,
     pub filter_size: u32,
@@ -79,7 +79,7 @@ pub struct SsTableFooter {
     pub index_size: u32,
 }
 
-impl Codable for SsTableFooter {
+impl Codable for Footer {
     fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         writer.write_u64::<LittleEndian>(self.filter_offset)?;
         writer.write_u32::<LittleEndian>(self.filter_size)?;
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn footer_size() -> TestResult<()> {
         let mut bytes = Vec::new();
-        SsTableFooter {
+        Footer {
             filter_offset: 0,
             filter_size: 10,
             index_offset: 10,

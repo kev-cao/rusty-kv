@@ -1,4 +1,4 @@
-use super::KVIterator;
+use super::KVIter;
 use std::{borrow::Borrow, collections::VecDeque, fmt::Debug, iter::Iterator, mem, vec};
 
 #[derive(Debug)]
@@ -225,7 +225,7 @@ impl<K: Ord, V> BTree<K, V> {
         self.root = new_root;
     }
 
-    pub fn kv_iter(&self) -> impl KVIterator<Key = K, Value = V> {
+    pub fn kv_iter(&self) -> impl KVIter<Key = K, Value = V> {
         BTreeIter::new(self)
     }
 
@@ -375,7 +375,7 @@ impl<'a, K: Ord, V> BTreeIter<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord, V> KVIterator for BTreeIter<'a, K, V> {
+impl<'a, K: Ord, V> KVIter for BTreeIter<'a, K, V> {
     type Key = K;
     type Value = V;
     type Error = ();
@@ -541,7 +541,7 @@ impl<'a, K: Ord, V> Iterator for BTreeIter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if !KVIterator::next(self).unwrap_or(false) {
+        if !KVIter::next(self).unwrap_or(false) {
             return None;
         }
         let kv = self.curr_kv()?;

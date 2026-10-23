@@ -23,12 +23,12 @@ pub const RESTART_INTERVAL: u32 = 16;
  * +-------------------+------------------+--------------+-----------+-------+
  * */
 #[derive(Debug)]
-pub struct SsTableBlock {
+pub struct Block {
     pub data: Vec<u8>,
     pub restart_array: Vec<u32>,
 }
 
-impl SsTableBlock {
+impl Block {
     fn new() -> Self {
         Self {
             data: Vec::new(),
@@ -94,9 +94,9 @@ impl SsTableBlock {
 }
 
 #[derive(Snafu, Debug)]
-pub enum SsTableBlockBuilderError {
+pub enum BlockBuilderError {
     #[snafu(context(false), display("SSTable io operation failed"))]
-    IoError {
+    Io {
         source: io::Error,
         backtrace: snafu::Backtrace,
     },
@@ -107,7 +107,7 @@ pub enum SsTableBlockBuilderError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SsTableBlockBuilderOpts {
+pub struct BlockBuilderOpts {
     /// The maximum size of the block in bytes. This serves as a soft-limit;
     /// once the block exceeds or equals this size, the builder will no longer
     /// accepts new KV pairs.
@@ -116,7 +116,7 @@ pub struct SsTableBlockBuilderOpts {
     pub restart_interval: u32,
 }
 
-impl Default for SsTableBlockBuilderOpts {
+impl Default for BlockBuilderOpts {
     fn default() -> Self {
         Self {
             max_size: BLOCK_MAX_SIZE,
@@ -125,16 +125,16 @@ impl Default for SsTableBlockBuilderOpts {
     }
 }
 
-pub struct SsTableBlockBuilder {
-    block: SsTableBlock,
+pub struct BlockBuilder {
+    block: Block,
     last_restart_key: Option<Key>,
     curr_restart_len: u32,
-    opts: SsTableBlockBuilderOpts,
+    opts: BlockBuilderOpts,
 }
 
-impl SsTableBlockBuilder {
-    pub fn new(opts: SsTableBlockBuilderOpts) -> Self {
-        let mut block = SsTableBlock::new();
+impl BlockBuilder {
+    pub fn new(opts: BlockBuilderOpts) -> Self {
+        let mut block = Block::new();
         // We never allow an empty block, so we'll insert the first restart
         // point to keep the logic below simpler.
         block.restart_array.push(0);
@@ -149,7 +149,7 @@ impl SsTableBlockBuilder {
     /// Adds a key-value pair to the block. Returns true if the block is full
     /// after adding the pair. This assumes that the keys are added in sorted
     /// order.
-    pub fn add_kv(&mut self, key: &Key, value: &Value) -> Result<bool, SsTableBlockBuilderError> {
+    pub fn add_kv(&mut self, key: &Key, value: &Value) -> Result<bool, BlockBuilderError> {
         let mut written = self.block.data.len();
         if written >= self.opts.max_size as usize {
             return BlockFullSnafu.fail();
@@ -185,7 +185,7 @@ impl SsTableBlockBuilder {
     }
 
     /// Finalizes the block and returns the built `SsTableBlock`.
-    pub fn finish(self) -> Result<SsTableBlock, SsTableBlockBuilderError> {
+    pub fn finish(self) -> Result<Block, BlockBuilderError> {
         if self.block.data.is_empty() {
             return EmptyBlockSnafu.fail();
         }
@@ -346,11 +346,11 @@ mod tests {
         #[case] keys: Vec<Key>,
         #[case] exp_n_restarts: usize,
     ) -> TestResult<()> {
-        let opts = SsTableBlockBuilderOpts {
+        let opts = BlockBuilderOpts {
             max_size: 1024,
             restart_interval,
         };
-        let mut builder = SsTableBlockBuilder::new(opts);
+        let mut builder = BlockBuilder::new(opts);
         // To keep things simple, our value will make up 10 bytes, including its
         // length encoding.
         let val = value(b"10bytes");
@@ -367,15 +367,15 @@ mod tests {
 
     #[test]
     fn fail_on_empty_block() -> TestResult<()> {
-        let opts = SsTableBlockBuilderOpts {
+        let opts = BlockBuilderOpts {
             max_size: 1024,
             restart_interval: 2,
         };
-        let builder = SsTableBlockBuilder::new(opts);
+        let builder = BlockBuilder::new(opts);
         let result = builder.finish();
         assert_matches!(
             result,
-            Err(SsTableBlockBuilderError::EmptyBlock { .. }),
+            Err(BlockBuilderError::EmptyBlock { .. }),
             "finishing an empty block should return EmptyBlock error"
         );
         Ok(())
@@ -383,17 +383,17 @@ mod tests {
 
     #[test]
     fn fail_on_full_block() -> TestResult<()> {
-        let opts = SsTableBlockBuilderOpts {
+        let opts = BlockBuilderOpts {
             max_size: 30, // small size to trigger full block
             restart_interval: 2,
         };
-        let mut builder = SsTableBlockBuilder::new(opts);
+        let mut builder = BlockBuilder::new(opts);
         let val = value(b"10bytes");
         builder.add_kv(&key(b"apple"), &val)?;
         builder.add_kv(&key(b"banana"), &val)?;
         assert_matches!(
             builder.add_kv(&key(b"cherry"), &val),
-            Err(SsTableBlockBuilderError::BlockFull { .. }),
+            Err(BlockBuilderError::BlockFull { .. }),
             "adding a key-value pair to a full block should return BlockFull error"
         );
         Ok(())
@@ -401,11 +401,11 @@ mod tests {
 
     #[test]
     fn roundtrip_encode_decode_block() -> TestResult<()> {
-        let opts = SsTableBlockBuilderOpts {
+        let opts = BlockBuilderOpts {
             max_size: 1024,
             restart_interval: 2,
         };
-        let mut builder = SsTableBlockBuilder::new(opts);
+        let mut builder = BlockBuilder::new(opts);
         let val = value(b"10bytes");
         let keys = vec![key(b"apple"), key(b"banana"), key(b"cherry")];
         for key in &keys {
@@ -416,8 +416,7 @@ mod tests {
         block
             .encode(&mut encoded_block)
             .expect("encoding block should succeed");
-        let decoded_block =
-            SsTableBlock::decode(&mut encoded_block.as_slice(), encoded_block.len())?;
+        let decoded_block = Block::decode(&mut encoded_block.as_slice(), encoded_block.len())?;
         assert_eq!(
             block.data, decoded_block.data,
             "decoded block data should match original"

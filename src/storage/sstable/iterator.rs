@@ -7,25 +7,25 @@ use std::{
 use super::index;
 use crate::storage::sstable::{SsTable, SsTableError, block};
 use crate::storage::{
-    collections::KVIterator,
+    collections::KVIter,
     kv::{Key, Value},
 };
 use snafu::prelude::*;
 
 #[derive(Snafu, Debug)]
-pub enum SsTableIteratorError {
+pub enum SstIterError {
     #[snafu(context(false), display("SSTable io operation failed"))]
-    IoError {
+    Io {
         source: io::Error,
         backtrace: snafu::Backtrace,
     },
     #[snafu(context(false), display("SSTable error: {source}"))]
-    SsTableError {
+    SsTable {
         source: SsTableError,
         backtrace: snafu::Backtrace,
     },
     #[snafu(display("SSTable iterator is poisoned, reset or re-seek required"))]
-    IteratorPoisoned { backtrace: snafu::Backtrace },
+    IterPoisoned { backtrace: snafu::Backtrace },
     #[snafu(whatever, display("{message}"))]
     Whatever {
         message: String,
@@ -35,7 +35,7 @@ pub enum SsTableIteratorError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum SsTableIteratorState {
+enum SstIterState {
     /// The iterator is positioned at a valid key-value pair.
     Valid,
     /// The iterator has been exhausted and requires a `reset` or `seek` before
@@ -46,18 +46,18 @@ enum SsTableIteratorState {
     Poisoned,
 }
 
-pub struct SsTableIterator<'a> {
+pub struct SstIter<'a> {
     sstable: &'a SsTable,
     key: Option<Key>,
     value: Option<Value>,
     block_iter: Option<BlockIter<'a>>,
-    state: SsTableIteratorState,
+    state: SstIterState,
 }
 
 struct BlockIter<'a> {
-    entry: &'a index::SsTableIndexEntry,
+    entry: &'a index::IndexEntry,
     entry_index: usize,
-    block: block::SsTableBlock,
+    block: block::Block,
     /// Restart index represents the index of the restart point that the cursor
     /// is currently at. When a cursor is at the beginning of a block and has
     /// yet to visit the first key, the restart index is -1.
@@ -66,13 +66,13 @@ struct BlockIter<'a> {
     offset: usize,
 }
 
-impl<'a> SsTableIterator<'a> {
+impl<'a> SstIter<'a> {
     pub fn new(sstable: &'a SsTable) -> Self {
         Self {
             key: None,
             value: None,
             block_iter: None,
-            state: SsTableIteratorState::Valid,
+            state: SstIterState::Valid,
             sstable,
         }
     }
@@ -81,15 +81,15 @@ impl<'a> SsTableIterator<'a> {
     pub fn reset(&mut self) {
         self.key = None;
         self.value = None;
-        self.state = SsTableIteratorState::Valid;
+        self.state = SstIterState::Valid;
         self.block_iter = None;
     }
 
     /// Loads the block at the given index into the iterator. Returns true if the
     /// block was loaded, false if the index is out of bounds.
-    fn load_block_n(&mut self, n: usize) -> Result<bool, SsTableIteratorError> {
+    fn load_block_n(&mut self, n: usize) -> Result<bool, SstIterError> {
         let Some(entry) = self.sstable.index.0.get(n) else {
-            self.state = SsTableIteratorState::Exhausted;
+            self.state = SstIterState::Exhausted;
             return Ok(false);
         };
 
@@ -104,23 +104,20 @@ impl<'a> SsTableIterator<'a> {
             entry,
             entry_index: n,
             key_prefix: None,
-            block: block::SsTableBlock::decode(
-                &mut block_data.as_slice(),
-                entry.block_size as usize,
-            )?,
+            block: block::Block::decode(&mut block_data.as_slice(), entry.block_size as usize)?,
             restart_index: -1,
             offset: 0,
         });
         Ok(true)
     }
 
-    fn next_inner(&mut self) -> Result<bool, SsTableIteratorError> {
+    fn next_inner(&mut self) -> Result<bool, SstIterError> {
         match self.state {
-            SsTableIteratorState::Exhausted => {
+            SstIterState::Exhausted => {
                 return Ok(false);
             }
-            SsTableIteratorState::Poisoned => {
-                IteratorPoisonedSnafu.fail()?;
+            SstIterState::Poisoned => {
+                IterPoisonedSnafu.fail()?;
             }
             _ => {}
         };
@@ -168,12 +165,12 @@ impl<'a> SsTableIterator<'a> {
         Ok(true)
     }
 
-    fn seek_ge_inner<Q>(&mut self, key: &Q) -> Result<bool, SsTableIteratorError>
+    fn seek_ge_inner<Q>(&mut self, key: &Q) -> Result<bool, SstIterError>
     where
         Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        self.state = SsTableIteratorState::Valid;
+        self.state = SstIterState::Valid;
         let Some((_, entry_index)) = self.sstable.index.key_block(key) else {
             self.set_exhausted();
             return Ok(false);
@@ -192,7 +189,7 @@ impl<'a> SsTableIterator<'a> {
         Ok(true)
     }
 
-    fn seek_ge_in_block<Q>(&mut self, key: &Q) -> Result<(), SsTableIteratorError>
+    fn seek_ge_in_block<Q>(&mut self, key: &Q) -> Result<(), SstIterError>
     where
         Key: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -247,12 +244,12 @@ impl<'a> SsTableIterator<'a> {
         );
     }
 
-    fn seek_lt_inner<Q>(&mut self, key: &Q) -> Result<bool, SsTableIteratorError>
+    fn seek_lt_inner<Q>(&mut self, key: &Q) -> Result<bool, SstIterError>
     where
         Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        self.state = SsTableIteratorState::Valid;
+        self.state = SstIterState::Valid;
         // Let there be two adjacent blocks with last keys α and β, where α < β,
         // called b-α and b-β. Assume b-α and b-β are potential candidates for
         // containing the search query ε.
@@ -296,7 +293,7 @@ impl<'a> SsTableIterator<'a> {
         Ok(true)
     }
 
-    fn seek_lt_in_block<Q>(&mut self, key: &Q) -> Result<bool, SsTableIteratorError>
+    fn seek_lt_in_block<Q>(&mut self, key: &Q) -> Result<bool, SstIterError>
     where
         Key: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -365,7 +362,7 @@ impl<'a> SsTableIterator<'a> {
 
     /// Seeks until the iterator is positioned at the last key in the current
     /// block.
-    fn seek_last_key_in_block(&mut self) -> Result<(), SsTableIteratorError> {
+    fn seek_last_key_in_block(&mut self) -> Result<(), SstIterError> {
         let Some(block_iter) = &mut self.block_iter else {
             whatever!("unexpectedly called last_key_in_block with no current block loaded");
         };
@@ -391,14 +388,14 @@ impl<'a> SsTableIterator<'a> {
     fn set_exhausted(&mut self) {
         self.key = None;
         self.value = None;
-        self.state = SsTableIteratorState::Exhausted;
+        self.state = SstIterState::Exhausted;
     }
 }
 
-impl<'a> KVIterator for SsTableIterator<'a> {
+impl<'a> KVIter for SstIter<'a> {
     type Key = Key;
     type Value = Value;
-    type Error = SsTableIteratorError;
+    type Error = SstIterError;
 
     fn key(&self) -> Result<Option<&Self::Key>, Self::Error> {
         Ok(self.key.as_ref())
@@ -410,7 +407,7 @@ impl<'a> KVIterator for SsTableIterator<'a> {
 
     fn next(&mut self) -> Result<bool, Self::Error> {
         self.next_inner().inspect_err(|_| {
-            self.state = SsTableIteratorState::Poisoned;
+            self.state = SstIterState::Poisoned;
         })
     }
 
@@ -420,7 +417,7 @@ impl<'a> KVIterator for SsTableIterator<'a> {
         Q: Ord + ?Sized,
     {
         self.seek_ge_inner(key).inspect_err(|_| {
-            self.state = SsTableIteratorState::Poisoned;
+            self.state = SstIterState::Poisoned;
         })
     }
 
@@ -430,14 +427,14 @@ impl<'a> KVIterator for SsTableIterator<'a> {
         Q: Ord + ?Sized,
     {
         self.seek_lt_inner(key).inspect_err(|_| {
-            self.state = SsTableIteratorState::Poisoned;
+            self.state = SstIterState::Poisoned;
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::SsTableBuildOpts;
+    use super::super::SstBuildOpts;
     use super::super::testutils::*;
     use super::*;
     use crate::storage::sstable::block;
@@ -464,11 +461,11 @@ mod tests {
             large_restart_opts(),
             massive_block_and_restart_opts()
         )]
-        opts: SsTableBuildOpts,
+        opts: SstBuildOpts,
         #[case] seek_key: Key,
         #[case] expected_key: Option<Key>,
     ) -> TestResult<()> {
-        let SsTableFixture {
+        let SstFixture {
             sstable,
             dir: _dir,
             filepath: _,
@@ -499,9 +496,9 @@ mod tests {
             large_restart_opts(),
             massive_block_and_restart_opts()
         )]
-        opts: SsTableBuildOpts,
+        opts: SstBuildOpts,
     ) -> TestResult<()> {
-        let SsTableFixture {
+        let SstFixture {
             sstable,
             entries,
             dir: _dir,
@@ -536,7 +533,7 @@ mod tests {
             large_restart_opts(),
             massive_block_and_restart_opts()
         )]
-        opts: SsTableBuildOpts,
+        opts: SstBuildOpts,
         #[case] seek_key: Key,
         #[case] next_key: Option<Key>,
     ) -> TestResult<()> {
@@ -575,11 +572,11 @@ mod tests {
             large_restart_opts(),
             massive_block_and_restart_opts()
         )]
-        opts: SsTableBuildOpts,
+        opts: SstBuildOpts,
         #[case] seek_key: Key,
         #[case] expected_key: Option<Key>,
     ) -> TestResult<()> {
-        let SsTableFixture {
+        let SstFixture {
             sstable,
             dir: _dir,
             filepath: _,
@@ -613,7 +610,7 @@ mod tests {
             large_restart_opts(),
             massive_block_and_restart_opts()
         )]
-        opts: SsTableBuildOpts,
+        opts: SstBuildOpts,
         #[case] seek_key: Key,
         #[case] expected_key: Option<Key>,
     ) -> TestResult<()> {
@@ -637,9 +634,9 @@ mod tests {
     #[rstest]
     fn reset(
         default_kvs: Vec<(Key, Value)>,
-        #[values(normal_block_opts())] opts: SsTableBuildOpts,
+        #[values(normal_block_opts())] opts: SstBuildOpts,
     ) -> TestResult<()> {
-        let SsTableFixture {
+        let SstFixture {
             sstable,
             entries,
             dir: _dir,
@@ -652,7 +649,7 @@ mod tests {
         assert!(!iter.next()?);
         assert_eq!(iter.key()?, None);
         assert_eq!(iter.value()?, None);
-        assert_eq!(iter.state, SsTableIteratorState::Exhausted);
+        assert_eq!(iter.state, SstIterState::Exhausted);
         iter.reset();
         assert!(iter.next()?);
         assert_eq!(iter.key()?, Some(&entries[0].0));
@@ -662,7 +659,7 @@ mod tests {
 
     #[rstest]
     fn poisoned_iter(default_kvs: Vec<(Key, Value)>) -> TestResult<()> {
-        let SsTableFixture {
+        let SstFixture {
             sstable,
             dir: _dir,
             filepath,
@@ -689,7 +686,7 @@ mod tests {
         // Since we corrupted the second block, we expect to be able to iterate
         // the first block successfully and then encounter an error on the
         // second when using a clean iterator.
-        let verify_success_iter_and_fail = |iter: &mut SsTableIterator| {
+        let verify_success_iter_and_fail = |iter: &mut SstIter| {
             let mut success_iters = 0;
             let terminating_result = loop {
                 let res = iter.next();
@@ -710,7 +707,7 @@ mod tests {
             assert_matches!(
                 iter.next()
                     .expect_err("expected poisoned iterator to return an error"),
-                SsTableIteratorError::IteratorPoisoned { .. },
+                SstIterError::IterPoisoned { .. },
             );
         };
 
@@ -733,9 +730,9 @@ mod tests {
     // assume that a block size of 128 bytes and a restart interval of 6 is
     // considered "normal" since the tests are using a small number of keys and
     // values.
-    fn normal_block_opts() -> SsTableBuildOpts {
-        SsTableBuildOpts {
-            block_opts: block::SsTableBlockBuilderOpts {
+    fn normal_block_opts() -> SstBuildOpts {
+        SstBuildOpts {
+            block_opts: block::BlockBuilderOpts {
                 max_size: 128,
                 restart_interval: 6,
             },
@@ -743,9 +740,9 @@ mod tests {
         }
     }
 
-    fn small_block_opts() -> SsTableBuildOpts {
-        SsTableBuildOpts {
-            block_opts: block::SsTableBlockBuilderOpts {
+    fn small_block_opts() -> SstBuildOpts {
+        SstBuildOpts {
+            block_opts: block::BlockBuilderOpts {
                 max_size: 32,
                 restart_interval: 6,
             },
@@ -754,9 +751,9 @@ mod tests {
     }
 
     /// Tiny block size to force each key/value into its own block.
-    fn tiny_block_opts() -> SsTableBuildOpts {
-        SsTableBuildOpts {
-            block_opts: block::SsTableBlockBuilderOpts {
+    fn tiny_block_opts() -> SstBuildOpts {
+        SstBuildOpts {
+            block_opts: block::BlockBuilderOpts {
                 max_size: 8,
                 restart_interval: 6,
             },
@@ -764,9 +761,9 @@ mod tests {
         }
     }
 
-    fn large_block_opts() -> SsTableBuildOpts {
-        SsTableBuildOpts {
-            block_opts: block::SsTableBlockBuilderOpts {
+    fn large_block_opts() -> SstBuildOpts {
+        SstBuildOpts {
+            block_opts: block::BlockBuilderOpts {
                 max_size: 256,
                 restart_interval: 6,
             },
@@ -774,9 +771,9 @@ mod tests {
         }
     }
 
-    fn massive_block_opts() -> SsTableBuildOpts {
-        SsTableBuildOpts {
-            block_opts: block::SsTableBlockBuilderOpts {
+    fn massive_block_opts() -> SstBuildOpts {
+        SstBuildOpts {
+            block_opts: block::BlockBuilderOpts {
                 max_size: 1024,
                 restart_interval: 6,
             },
@@ -784,9 +781,9 @@ mod tests {
         }
     }
 
-    fn small_restart_opts() -> SsTableBuildOpts {
-        SsTableBuildOpts {
-            block_opts: block::SsTableBlockBuilderOpts {
+    fn small_restart_opts() -> SstBuildOpts {
+        SstBuildOpts {
+            block_opts: block::BlockBuilderOpts {
                 max_size: 128,
                 restart_interval: 2,
             },
@@ -794,9 +791,9 @@ mod tests {
         }
     }
 
-    fn large_restart_opts() -> SsTableBuildOpts {
-        SsTableBuildOpts {
-            block_opts: block::SsTableBlockBuilderOpts {
+    fn large_restart_opts() -> SstBuildOpts {
+        SstBuildOpts {
+            block_opts: block::BlockBuilderOpts {
                 max_size: 128,
                 restart_interval: 12,
             },
@@ -806,9 +803,9 @@ mod tests {
 
     /// Large enough to store all of the test keys and values in a single block,
     /// with a single restart point.
-    fn massive_block_and_restart_opts() -> SsTableBuildOpts {
-        SsTableBuildOpts {
-            block_opts: block::SsTableBlockBuilderOpts {
+    fn massive_block_and_restart_opts() -> SstBuildOpts {
+        SstBuildOpts {
+            block_opts: block::BlockBuilderOpts {
                 max_size: 1024,
                 restart_interval: 32,
             },

@@ -8,14 +8,14 @@ use crate::storage::encoding::Codable;
 const FILTER_SIZE: u32 = 12 * 1024; // 12 KiB
 const NUM_HASHES: u32 = 7;
 
-pub struct BloomFilter {
+pub struct Filter {
     bits: Vec<u8>,
     /// size is a u32, which can be safely converted to usize on all platforms.
     size: u32,
     num_hashes: u32,
 }
 
-impl BloomFilter {
+impl Filter {
     pub fn new(size: u32, num_hashes: u32) -> Self {
         Self {
             bits: vec![0; size as usize],
@@ -42,13 +42,13 @@ impl BloomFilter {
     }
 }
 
-impl AsRef<[u8]> for BloomFilter {
+impl AsRef<[u8]> for Filter {
     fn as_ref(&self) -> &[u8] {
         self.bits.as_ref()
     }
 }
 
-impl Codable for BloomFilter {
+impl Codable for Filter {
     fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         writer.write_u32::<LittleEndian>(self.bits.len() as u32)?;
         writer.write_u32::<LittleEndian>(self.num_hashes)?;
@@ -77,12 +77,12 @@ fn create_seed(n: u32) -> u64 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BloomFilterOpts {
+pub struct FilterOpts {
     pub filter_size: u32,
     pub num_hashes: u32,
 }
 
-impl Default for BloomFilterOpts {
+impl Default for FilterOpts {
     fn default() -> Self {
         // 12 KiB bloom filter size and 7 hashes can accomodate 10k keys at a 1%
         // false positive rate.
@@ -93,7 +93,7 @@ impl Default for BloomFilterOpts {
     }
 }
 
-impl Codable for BloomFilterOpts {
+impl Codable for FilterOpts {
     fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         writer.write_u32::<LittleEndian>(self.filter_size)?;
         writer.write_u32::<LittleEndian>(self.num_hashes)?;
@@ -110,15 +110,15 @@ impl Codable for BloomFilterOpts {
     }
 }
 
-pub struct BloomFilterBuilder {
-    filter: BloomFilter,
-    opts: BloomFilterOpts,
+pub struct FilterBuilder {
+    filter: Filter,
+    opts: FilterOpts,
 }
 
-impl BloomFilterBuilder {
-    pub fn new(opts: BloomFilterOpts) -> Self {
+impl FilterBuilder {
+    pub fn new(opts: FilterOpts) -> Self {
         Self {
-            filter: BloomFilter::new(opts.filter_size, opts.num_hashes),
+            filter: Filter::new(opts.filter_size, opts.num_hashes),
             opts,
         }
     }
@@ -135,7 +135,7 @@ impl BloomFilterBuilder {
     }
 
     /// Finalizes the bloom filter and returns it.
-    pub fn finish(self) -> BloomFilter {
+    pub fn finish(self) -> Filter {
         self.filter
     }
 }
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn bloom_roundtrip() {
         let (mut seeded_rng, _) = seeded_rng(None);
-        let mut builder = BloomFilterBuilder::new(BloomFilterOpts::default());
+        let mut builder = FilterBuilder::new(FilterOpts::default());
 
         let keys = (0..100)
             .map(|_| {
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn bloom_nonexistence() {
         let (mut seeded_rng, _) = seeded_rng(None);
-        let mut builder = BloomFilterBuilder::new(BloomFilterOpts::default());
+        let mut builder = FilterBuilder::new(FilterOpts::default());
 
         for _ in 0..100 {
             let mut key = generate_rand_bytes(16, &mut seeded_rng);
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn bloom_false_positive_rate() {
         let (mut seeded_rng, _) = seeded_rng(None);
-        let mut builder = BloomFilterBuilder::new(BloomFilterOpts::default());
+        let mut builder = FilterBuilder::new(FilterOpts::default());
         const EXP_NUM_ITEMS: u32 = 10_000;
 
         for _ in 0..EXP_NUM_ITEMS {
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn bloom_filter_encode_decode() {
         let (mut seeded_rng, _) = seeded_rng(None);
-        let mut builder = BloomFilterBuilder::new(BloomFilterOpts::default());
+        let mut builder = FilterBuilder::new(FilterOpts::default());
 
         for _ in 0..100 {
             let key = generate_rand_bytes(16, &mut seeded_rng);
@@ -244,7 +244,7 @@ mod tests {
             .encode(&mut buf)
             .expect("failed to encode bloom filter");
         let decoded_filter =
-            BloomFilter::decode(&mut buf.as_slice()).expect("failed to decode bloom filter");
+            Filter::decode(&mut buf.as_slice()).expect("failed to decode bloom filter");
 
         assert_eq!(filter.size, decoded_filter.size);
         assert_eq!(filter.num_hashes, decoded_filter.num_hashes);

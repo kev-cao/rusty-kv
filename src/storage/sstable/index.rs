@@ -5,13 +5,13 @@ use std::io::{self};
 use crate::storage::encoding::Codable;
 use crate::storage::kv::Key;
 
-pub struct SsTableIndexEntry {
+pub struct IndexEntry {
     pub last_key: Key,
     pub block_offset: u64,
     pub block_size: u32,
 }
 
-impl Codable for SsTableIndexEntry {
+impl Codable for IndexEntry {
     fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         let key_length = self.last_key.encode(writer)?;
         writer.write_u64::<LittleEndian>(self.block_offset)?;
@@ -28,28 +28,28 @@ impl Codable for SsTableIndexEntry {
     }
 }
 
-pub struct SsTableIndex(pub Vec<SsTableIndexEntry>);
+pub struct Index(pub Vec<IndexEntry>);
 
-impl<'a> IntoIterator for &'a SsTableIndex {
-    type Item = &'a SsTableIndexEntry;
-    type IntoIter = std::slice::Iter<'a, SsTableIndexEntry>;
+impl<'a> IntoIterator for &'a Index {
+    type Item = &'a IndexEntry;
+    type IntoIter = std::slice::Iter<'a, IndexEntry>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
     }
 }
 
-impl IntoIterator for SsTableIndex {
-    type Item = SsTableIndexEntry;
-    type IntoIter = std::vec::IntoIter<SsTableIndexEntry>;
+impl IntoIterator for Index {
+    type Item = IndexEntry;
+    type IntoIter = std::vec::IntoIter<IndexEntry>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
     }
 }
 
-impl SsTableIndex {
-    pub fn new() -> SsTableIndex {
+impl Index {
+    pub fn new() -> Index {
         Self(vec![])
     }
 
@@ -57,7 +57,7 @@ impl SsTableIndex {
     /// guaranteed to not exist in the index, as it lays beyond the last key in
     /// the index, returns None. Otherwise, returns the index entry that may
     /// contain the key. Also returns the index of the entry in the index vector.
-    pub fn key_block<Q>(&self, key: &Q) -> Option<(&SsTableIndexEntry, usize)>
+    pub fn key_block<Q>(&self, key: &Q) -> Option<(&IndexEntry, usize)>
     where
         Key: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -72,7 +72,7 @@ impl SsTableIndex {
     }
 }
 
-impl Codable for SsTableIndex {
+impl Codable for Index {
     fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
         let mut written = size_of::<u32>();
         writer.write_u32::<LittleEndian>(self.0.len() as u32)?;
@@ -86,22 +86,22 @@ impl Codable for SsTableIndex {
         let len = reader.read_u32::<LittleEndian>()?;
         let mut ret = Self::new();
         for _ in 0..len {
-            let entry = SsTableIndexEntry::decode(reader)?;
+            let entry = IndexEntry::decode(reader)?;
             ret.0.push(entry);
         }
         Ok(ret)
     }
 }
 
-pub struct SsTableIndexBuilder {
-    index: SsTableIndex,
+pub struct IndexBuilder {
+    index: Index,
     current_offset: u64,
 }
 
-impl SsTableIndexBuilder {
+impl IndexBuilder {
     pub fn new() -> Self {
         Self {
-            index: SsTableIndex::new(),
+            index: Index::new(),
             current_offset: 0,
         }
     }
@@ -109,7 +109,7 @@ impl SsTableIndexBuilder {
     /// Adds a new block to the index. Last key refers to the last key in the
     /// block being added.
     pub fn add_block(&mut self, block_size: u32, last_key: &Key) {
-        let entry = SsTableIndexEntry {
+        let entry = IndexEntry {
             last_key: last_key.clone(),
             block_offset: self.current_offset,
             block_size,
@@ -119,7 +119,7 @@ impl SsTableIndexBuilder {
     }
 
     /// Finalizes the index and returns the built SSTableIndex.
-    pub fn finish(self) -> SsTableIndex {
+    pub fn finish(self) -> Index {
         self.index
     }
 }
@@ -128,7 +128,7 @@ impl SsTableIndexBuilder {
 mod tests {
     use super::*;
     use crate::{
-        storage::sstable::block::SsTableBlockBuilder,
+        storage::sstable::block::BlockBuilder,
         testutils::{TestResult, generate_rand_bytes, key, seeded_rng, value},
     };
 
@@ -138,7 +138,7 @@ mod tests {
         const KEY_LEN: usize = 16;
         let key = key(&generate_rand_bytes(KEY_LEN, &mut rng));
 
-        let index_entry = SsTableIndexEntry {
+        let index_entry = IndexEntry {
             last_key: key,
             block_offset: 16,
             block_size: 32,
@@ -149,7 +149,7 @@ mod tests {
             .encode(&mut buf)
             .expect("failed to encode index entry");
         let decoded_entry =
-            SsTableIndexEntry::decode(&mut buf.as_slice()).expect("failed to decode index entry");
+            IndexEntry::decode(&mut buf.as_slice()).expect("failed to decode index entry");
 
         assert_eq!(index_entry.last_key, decoded_entry.last_key);
         assert_eq!(index_entry.block_offset, decoded_entry.block_offset);
@@ -158,8 +158,8 @@ mod tests {
 
     #[test]
     fn sstable_index_key_block_offset() -> TestResult<()> {
-        let mut index_builder = SsTableIndexBuilder::new();
-        let mut block_builder = SsTableBlockBuilder::new(Default::default());
+        let mut index_builder = IndexBuilder::new();
+        let mut block_builder = BlockBuilder::new(Default::default());
 
         // Loop must end on an odd number so that we flush the last block.
         for i in 0..=5 {
@@ -173,7 +173,7 @@ mod tests {
                     .encode(&mut io::sink())
                     .expect("failed to encode block");
                 index_builder.add_block(block_size as u32, &k);
-                block_builder = SsTableBlockBuilder::new(Default::default());
+                block_builder = BlockBuilder::new(Default::default());
             }
         }
         let index = index_builder.finish();

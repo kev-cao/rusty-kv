@@ -14,7 +14,7 @@ type KVs = Vec<(Key, Value)>;
 #[derive(Snafu, Debug)]
 pub enum WalError {
     #[snafu(context(false), display("WAL io operation failed: {source}"))]
-    IoError {
+    Io {
         source: io::Error,
         backtrace: snafu::Backtrace,
     },

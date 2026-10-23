@@ -3,7 +3,7 @@ use std::fmt::Debug;
 
 pub(super) mod btree;
 
-pub trait KVIterator {
+pub trait KVIter {
     type Key: Ord;
     type Value;
     type Error: Debug;

@@ -1,5 +1,5 @@
 mod block;
-mod bloom;
+mod filter;
 mod footer;
 mod index;
 mod iterator;
@@ -15,11 +15,11 @@ use std::{
 
 use crate::storage::{
     encoding::Codable,
-    sstable::footer::{FOOTER_TAIL_SIZE, SsTableFooter},
+    sstable::footer::{FOOTER_TAIL_SIZE, Footer},
 };
 use crate::storage::{
     kv::{Key, Value},
-    sstable::footer::SsTableFooterTail,
+    sstable::footer::FooterTail,
 };
 
 pub const SST_VERSION: u16 = 1;
@@ -27,17 +27,17 @@ pub const SST_VERSION: u16 = 1;
 #[derive(Snafu, Debug)]
 pub enum SsTableError {
     #[snafu(context(false), display("SSTable io operation failed"))]
-    IoError {
+    Io {
         source: io::Error,
         backtrace: snafu::Backtrace,
     },
     #[snafu(display("{reason}"))]
-    ValidationError {
+    Validation {
         reason: String,
         backtrace: snafu::Backtrace,
     },
     #[snafu(display("{reason}"))]
-    CorruptionError {
+    Corruption {
         reason: String,
         backtrace: snafu::Backtrace,
     },
@@ -45,9 +45,9 @@ pub enum SsTableError {
 
 pub struct SsTable {
     path: PathBuf,
-    filter: bloom::BloomFilter,
-    index: index::SsTableIndex,
-    footer: SsTableFooter,
+    filter: filter::Filter,
+    index: index::Index,
+    footer: Footer,
     file: fs::File,
 }
 
@@ -57,17 +57,17 @@ impl SsTable {
         let mut file = fs::File::open(&path)?;
 
         file.seek(SeekFrom::End(-(FOOTER_TAIL_SIZE as i64)))?;
-        let footer_tail = SsTableFooterTail::decode(&mut file)?;
+        let footer_tail = FooterTail::decode(&mut file)?;
         footer_tail.validate()?;
 
         file.seek(SeekFrom::End(-(footer_tail.footer_size as i64)))?;
-        let footer = SsTableFooter::decode(&mut file)?;
+        let footer = Footer::decode(&mut file)?;
 
         file.seek(SeekFrom::Start(footer.filter_offset))?;
-        let filter = bloom::BloomFilter::decode(&mut file)?;
+        let filter = filter::Filter::decode(&mut file)?;
 
         file.seek(SeekFrom::Start(footer.index_offset))?;
-        let index = index::SsTableIndex::decode(&mut file)?;
+        let index = index::Index::decode(&mut file)?;
 
         Ok(Self {
             path,
@@ -93,27 +93,27 @@ impl SsTable {
     }
 
     /// Returns an iterator over the key-value pairs in the SSTable.
-    pub fn kv_iter<'a>(&'a self) -> iterator::SsTableIterator<'a> {
-        iterator::SsTableIterator::new(self)
+    pub fn kv_iter<'a>(&'a self) -> iterator::SstIter<'a> {
+        iterator::SstIter::new(self)
     }
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
-pub struct SsTableBuildOpts {
-    pub block_opts: block::SsTableBlockBuilderOpts,
-    pub filter_opts: bloom::BloomFilterOpts,
+pub struct SstBuildOpts {
+    pub block_opts: block::BlockBuilderOpts,
+    pub filter_opts: filter::FilterOpts,
 }
 
 #[derive(Snafu, Debug)]
-pub enum SsTableBuilderError {
+pub enum SstBuilderError {
     #[snafu(context(false), display("SSTable io operation failed"))]
-    IoError {
+    Io {
         source: io::Error,
         backtrace: snafu::Backtrace,
     },
     #[snafu(context(false), display("Error building SSTable block"))]
-    BlockBuildError {
-        source: block::SsTableBlockBuilderError,
+    BlockBuild {
+        source: block::BlockBuilderError,
         backtrace: snafu::Backtrace,
     },
     #[snafu(whatever, display("{message}"))]
@@ -124,21 +124,18 @@ pub enum SsTableBuilderError {
     },
 }
 
-pub struct SsTableBuilder {
+pub struct SstBuilder {
     writer: io::BufWriter<fs::File>,
     filter_offset: u64,
-    filter: bloom::BloomFilterBuilder,
-    index: index::SsTableIndexBuilder,
-    block: block::SsTableBlockBuilder,
+    filter: filter::FilterBuilder,
+    index: index::IndexBuilder,
+    block: block::BlockBuilder,
     last_key: Option<Key>,
-    opts: SsTableBuildOpts,
+    opts: SstBuildOpts,
 }
 
-impl SsTableBuilder {
-    pub fn new(
-        path: impl AsRef<path::Path>,
-        opts: SsTableBuildOpts,
-    ) -> Result<Self, SsTableBuilderError> {
+impl SstBuilder {
+    pub fn new(path: impl AsRef<path::Path>, opts: SstBuildOpts) -> Result<Self, SstBuilderError> {
         Ok(Self {
             writer: io::BufWriter::new(
                 fs::OpenOptions::new()
@@ -147,16 +144,16 @@ impl SsTableBuilder {
                     .open(path)?,
             ),
             filter_offset: 0,
-            filter: bloom::BloomFilterBuilder::new(opts.filter_opts),
-            index: index::SsTableIndexBuilder::new(),
-            block: block::SsTableBlockBuilder::new(opts.block_opts),
+            filter: filter::FilterBuilder::new(opts.filter_opts),
+            index: index::IndexBuilder::new(),
+            block: block::BlockBuilder::new(opts.block_opts),
             last_key: None,
             opts,
         })
     }
 
     /// Adds a key-value pair to the SSTable.
-    pub fn add(&mut self, key: &Key, value: &Value) -> Result<(), SsTableBuilderError> {
+    pub fn add(&mut self, key: &Key, value: &Value) -> Result<(), SstBuilderError> {
         self.filter.insert(key.as_ref());
         self.last_key = Some(key.clone());
         if self.block.add_kv(key, value)? {
@@ -166,9 +163,9 @@ impl SsTableBuilder {
     }
 
     /// Finalizes the SSTable by writing it to the sink and flushing the writer.
-    pub fn finish(mut self) -> Result<(), SsTableBuilderError> {
+    pub fn finish(mut self) -> Result<(), SstBuilderError> {
         self.flush_block()?;
-        let mut footer = SsTableFooter {
+        let mut footer = Footer {
             filter_offset: self.filter_offset,
             filter_size: 0,
             index_offset: 0,
@@ -180,14 +177,14 @@ impl SsTableBuilder {
         footer.index_offset = footer.filter_offset + footer.filter_size as u64;
         footer.index_size = index.encode(&mut self.writer)? as u32;
         footer.encode(&mut self.writer)?;
-        SsTableFooterTail::new().encode(&mut self.writer)?;
+        FooterTail::new().encode(&mut self.writer)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
         Ok(())
     }
 
     /// Flushes the current block to the file and records it in the index.
-    fn flush_block(&mut self) -> Result<(), SsTableBuilderError> {
+    fn flush_block(&mut self) -> Result<(), SstBuilderError> {
         if self.block.is_empty() {
             return Ok(());
         }
@@ -196,7 +193,7 @@ impl SsTableBuilder {
         };
         let builder = std::mem::replace(
             &mut self.block,
-            block::SsTableBlockBuilder::new(self.opts.block_opts),
+            block::BlockBuilder::new(self.opts.block_opts),
         );
         let block = builder.finish()?;
         let written = block.encode(&mut self.writer)?;
@@ -217,8 +214,8 @@ mod tests {
     fn sstable_encoding() -> TestResult<()> {
         let dir = tempdir().expect("create tmp dir");
         let tmp_sst = dir.path().join("tempdata.sst");
-        let opts = SsTableBuildOpts::default();
-        let mut builder = SsTableBuilder::new(&tmp_sst, opts)?;
+        let opts = SstBuildOpts::default();
+        let mut builder = SstBuilder::new(&tmp_sst, opts)?;
         builder.add(&key(b"key1"), &value(b"value1"))?;
         builder.add(&key(b"key2"), &value(b"value2"))?;
         builder.finish()?;
@@ -235,7 +232,7 @@ mod tests {
     #[test]
     fn contains() -> TestResult<()> {
         let (mut rng, _) = seeded_rng(None);
-        let SsTableFixture {
+        let SstFixture {
             dir: _,
             filepath: _,
             sstable,

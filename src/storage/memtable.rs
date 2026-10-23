@@ -4,13 +4,13 @@ use snafu::prelude::*;
 use std::path::Path;
 use wal::Wal;
 
-use crate::storage::collections::{KVIterator, btree::BTree};
+use crate::storage::collections::{KVIter, btree::BTree};
 use crate::storage::kv::{Key, Value};
 
 #[derive(Snafu, Debug)]
 pub enum MemTableError {
     #[snafu(context(false), display("WAL operation failed: {source}"))]
-    WalOpError { source: wal::WalError },
+    WalOp { source: wal::WalError },
 }
 
 pub struct MemTableImpl<W: Wal> {
@@ -38,7 +38,7 @@ impl<W: Wal> MemTableImpl<W> {
         self.btree.get(key).map(|v| v)
     }
 
-    pub fn kv_iter(&self) -> impl KVIterator<Key = Key, Value = Value> {
+    pub fn kv_iter(&self) -> impl KVIter<Key = Key, Value = Value> {
         self.btree.kv_iter()
     }
 

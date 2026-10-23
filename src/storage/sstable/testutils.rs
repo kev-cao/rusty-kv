@@ -7,7 +7,7 @@ use super::*;
 const MAX_TEST_KEY_LEN: usize = u16::MAX as usize;
 const MAX_TEST_VAL_LEN: usize = u16::MAX as usize;
 
-pub struct SsTableFixture {
+pub struct SstFixture {
     // We return the temp dir so that it is not deleted until the test is
     // done.
     pub dir: TempDir,
@@ -17,7 +17,7 @@ pub struct SsTableFixture {
     pub entries: Vec<(Key, Value)>,
 }
 
-impl SsTableFixture {
+impl SstFixture {
     /// Fetches the expected value for a given key from the entries that were
     /// added to the SSTable.
     pub fn get_value(&self, key: &Key) -> Option<&Value> {
@@ -28,11 +28,11 @@ impl SsTableFixture {
     }
 }
 
-pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<SsTableFixture> {
+pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<SstFixture> {
     let dir = tempdir().expect("create tmp dir");
     let tmp_sst = dir.path().join("tempdata.sst");
-    let opts = SsTableBuildOpts::default();
-    let mut builder = SsTableBuilder::new(&tmp_sst, opts)?;
+    let opts = SstBuildOpts::default();
+    let mut builder = SstBuilder::new(&tmp_sst, opts)?;
 
     let mut entries = Vec::new();
     // Inserting data into an SSTable must always be in sorted order, so we
@@ -53,7 +53,7 @@ pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<
     builder.finish()?;
 
     let sstable = SsTable::open(&tmp_sst)?;
-    Ok(SsTableFixture {
+    Ok(SstFixture {
         dir,
         filepath: tmp_sst,
         sstable,
@@ -63,11 +63,11 @@ pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<
 
 pub fn create_sstable_with_kvs(
     mut kvs: Vec<(Key, Value)>,
-    opts: SsTableBuildOpts,
-) -> TestResult<SsTableFixture> {
+    opts: SstBuildOpts,
+) -> TestResult<SstFixture> {
     let dir = tempdir().expect("create tmp dir");
     let tmp_sst = dir.path().join("tempdata.sst");
-    let mut builder = SsTableBuilder::new(&tmp_sst, opts)?;
+    let mut builder = SstBuilder::new(&tmp_sst, opts)?;
 
     // SSTable requires keys to be added in sorted order, so we sort.
     kvs.sort_by(|(key1, _), (key2, _)| key1.cmp(key2));
@@ -78,7 +78,7 @@ pub fn create_sstable_with_kvs(
     builder.finish()?;
 
     let sstable = SsTable::open(&tmp_sst)?;
-    Ok(SsTableFixture {
+    Ok(SstFixture {
         dir,
         filepath: tmp_sst,
         sstable,
