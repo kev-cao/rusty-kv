@@ -1,7 +1,9 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use std::borrow::Borrow;
 use std::io;
 
 use crate::storage::{
+    collections::KVIter,
     kv::{Key, KeyLen, Value, ValueLen},
     sstable::{CorruptionSnafu, SsTableError},
 };
@@ -90,6 +92,216 @@ impl Block {
             data,
             restart_array,
         })
+    }
+}
+
+#[derive(Snafu, Debug)]
+pub enum BlockIterError {
+    #[snafu(context(false), display("block io operation failed"))]
+    Io {
+        source: io::Error,
+        backtrace: snafu::Backtrace,
+    },
+    #[snafu(whatever, display("{message}"))]
+    Whatever {
+        message: String,
+        #[snafu(source(from(Box<dyn std::error::Error>, Some)))]
+        source: Option<Box<dyn std::error::Error>>,
+    },
+}
+
+pub struct BlockIter {
+    key: Option<Key>,
+    value: Option<Value>,
+    block: Block,
+    /// Restart index represents the index of the restart point that the cursor
+    /// is currently at. When a cursor is at the beginning of a block and has
+    /// yet to visit the first key, the restart index is -1.
+    restart_index: i64,
+    key_prefix: Option<Key>,
+    offset: usize,
+}
+
+impl BlockIter {
+    pub fn new(block: Block) -> Self {
+        Self {
+            key: None,
+            value: None,
+            block,
+            restart_index: -1,
+            key_prefix: None,
+            offset: 0,
+        }
+    }
+
+    pub fn seek_to_last(&mut self) -> Result<bool, BlockIterError> {
+        if self.block.restart_array.is_empty() {
+            return Ok(false);
+        }
+        self.restart_index = (self.block.restart_array.len() - 1) as i64;
+        self.offset = self.block.restart_array[self.restart_index as usize] as usize;
+        while self.offset < self.block.data.len() {
+            self.next()?;
+        }
+        Ok(true)
+    }
+}
+
+impl KVIter for BlockIter {
+    type Key = Key;
+    type Value = Value;
+    type Error = BlockIterError;
+
+    fn key(&self) -> Result<Option<&Self::Key>, Self::Error> {
+        Ok(self.key.as_ref())
+    }
+
+    fn value(&self) -> Result<Option<&Self::Value>, Self::Error> {
+        Ok(self.value.as_ref())
+    }
+
+    fn next(&mut self) -> Result<bool, Self::Error> {
+        if self.offset >= self.block.data.len() {
+            self.key = None;
+            self.value = None;
+            return Ok(false);
+        }
+        if let Some(next_restart) = self
+            .block
+            .restart_array
+            .get((self.restart_index + 1) as usize)
+            && self.offset >= *next_restart as usize
+        {
+            self.restart_index += 1;
+            self.key_prefix = None;
+        }
+        let (key, value, bytes_read) = decode_kv_pair(
+            &mut &self.block.data[self.offset..],
+            self.key_prefix.as_ref(),
+        )?;
+        if self.key_prefix.is_none() {
+            self.key_prefix = Some(key.clone());
+        }
+        self.key = Some(key.clone());
+        self.value = Some(value);
+        self.offset += bytes_read;
+        Ok(true)
+    }
+
+    fn seek_ge<Q>(&mut self, key: &Q) -> Result<bool, Self::Error>
+    where
+        Self::Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut search_err = None;
+        let search_result = self.block.restart_array.binary_search_by(|&offset| {
+            match decode_key(&mut &self.block.data[offset as usize..], None) {
+                Ok((restart_key, _, _)) => restart_key.borrow().cmp(key),
+                Err(e) => {
+                    search_err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = search_err {
+            return Err(e.into());
+        }
+
+        // We set the restart index to the index *prior* of the restart interval
+        // we wish to seek within, so that we can just re-use the `next_inner()`
+        // logic. Setting to the prior index positions us at the start of the
+        // restart interval.
+        match search_result {
+            Ok(restart_idx) => {
+                self.restart_index = restart_idx as i64 - 1;
+                self.offset = self.block.restart_array[restart_idx] as usize;
+            }
+            Err(restart_idx) => {
+                if restart_idx == 0 {
+                    self.restart_index = -1;
+                    self.offset = 0;
+                } else {
+                    self.restart_index = restart_idx as i64 - 1;
+                    self.offset = self.block.restart_array[restart_idx - 1] as usize;
+                }
+            }
+        };
+        while self.next()? {
+            let Some(curr_key) = &self.key else {
+                whatever!("next returned true but key is None")
+            };
+            if curr_key.borrow() >= key {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn seek_lt<Q>(&mut self, key: &Q) -> Result<bool, Self::Error>
+    where
+        Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut search_err = None;
+        let search_result = self.block.restart_array.binary_search_by(|&offset| {
+            match decode_key(&mut &self.block.data[offset as usize..], None) {
+                Ok((restart_key, _, _)) => restart_key.borrow().cmp(key),
+                Err(e) => {
+                    search_err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = search_err {
+            return Err(e.into());
+        }
+
+        // Let i be the index i of some restart interval [α, β). For a given
+        // search key ε, the following cases are possible:
+        // 1. binary_search -> Ok(i)
+        //  - ε = α, so we should seek to the last key in the previous restart
+        //  interval.
+        // 2. binary_search -> Err(i)
+        //  - ε < α, so we should still seek within the previous restart
+        //  interval.
+        let search_restart_idx = match search_result {
+            Ok(restart_idx) => restart_idx as i64 - 1,
+            Err(restart_idx) => restart_idx as i64 - 1,
+        };
+        if search_restart_idx < 0 {
+            return Ok(false);
+        }
+        self.restart_index = search_restart_idx;
+        self.offset = self.block.restart_array[search_restart_idx as usize] as usize;
+
+        let interval_end = if (self.restart_index + 1) < self.block.restart_array.len() as i64 {
+            self.block.restart_array[(self.restart_index + 1) as usize] as usize
+        } else {
+            self.block.data.len()
+        };
+
+        while self.offset < interval_end {
+            let (k, v, bytes_read) = decode_kv_pair(
+                &mut &self.block.data[self.offset..],
+                self.key_prefix.as_ref(),
+            )?;
+            if self.key_prefix.is_none() {
+                self.key_prefix = Some(k.clone());
+            }
+            if k.borrow() >= key {
+                if self.offset == 0 {
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+            self.offset += bytes_read;
+            self.key = Some(k);
+            self.value = Some(v);
+        }
+
+        // Reached the end of the restart interval without finding a key >= ε,
+        // so the last key in the interval is the largest key < ε.
+        Ok(true)
     }
 }
 

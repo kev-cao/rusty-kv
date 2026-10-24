@@ -4,7 +4,6 @@ use std::{
     os::unix::fs::FileExt,
 };
 
-use super::index;
 use crate::storage::sstable::{SsTable, SsTableError, block};
 use crate::storage::{
     collections::KVIter,
@@ -22,6 +21,11 @@ pub enum SstIterError {
     #[snafu(context(false), display("SSTable error: {source}"))]
     SsTable {
         source: SsTableError,
+        backtrace: snafu::Backtrace,
+    },
+    #[snafu(context(false), display("Block error: {source}"))]
+    Block {
+        source: block::BlockIterError,
         backtrace: snafu::Backtrace,
     },
     #[snafu(display("SSTable iterator is poisoned, reset or re-seek required"))]
@@ -48,29 +52,16 @@ enum SstIterState {
 
 pub struct SstIter<'a> {
     sstable: &'a SsTable,
-    key: Option<Key>,
-    value: Option<Value>,
-    block_iter: Option<BlockIter<'a>>,
-    state: SstIterState,
-}
-
-struct BlockIter<'a> {
-    entry: &'a index::IndexEntry,
     entry_index: usize,
-    block: block::Block,
-    /// Restart index represents the index of the restart point that the cursor
-    /// is currently at. When a cursor is at the beginning of a block and has
-    /// yet to visit the first key, the restart index is -1.
-    restart_index: i64,
-    key_prefix: Option<Key>,
-    offset: usize,
+    /// The iterator for the current block. If None, no block has been loaded.
+    block_iter: Option<block::BlockIter>,
+    state: SstIterState,
 }
 
 impl<'a> SstIter<'a> {
     pub fn new(sstable: &'a SsTable) -> Self {
         Self {
-            key: None,
-            value: None,
+            entry_index: 0,
             block_iter: None,
             state: SstIterState::Valid,
             sstable,
@@ -79,18 +70,16 @@ impl<'a> SstIter<'a> {
 
     /// Resets the iterator.
     pub fn reset(&mut self) {
-        self.key = None;
-        self.value = None;
         self.state = SstIterState::Valid;
         self.block_iter = None;
     }
 
-    /// Loads the block at the given index into the iterator. Returns true if the
-    /// block was loaded, false if the index is out of bounds.
-    fn load_block_n(&mut self, n: usize) -> Result<bool, SstIterError> {
+    /// Loads the block at the given index into the iterator. Returns the loaded
+    /// iter if succesful, or None if the index is out of bounds.
+    fn load_block_n(&mut self, n: usize) -> Result<Option<&mut block::BlockIter>, SstIterError> {
         let Some(entry) = self.sstable.index.0.get(n) else {
             self.state = SstIterState::Exhausted;
-            return Ok(false);
+            return Ok(None);
         };
 
         let mut block_data = vec![0; entry.block_size as usize];
@@ -100,15 +89,12 @@ impl<'a> SstIter<'a> {
             .inspect_err(|_| {
                 self.block_iter = None;
             })?;
-        self.block_iter = Some(BlockIter {
-            entry,
-            entry_index: n,
-            key_prefix: None,
-            block: block::Block::decode(&mut block_data.as_slice(), entry.block_size as usize)?,
-            restart_index: -1,
-            offset: 0,
-        });
-        Ok(true)
+        self.entry_index = n;
+        self.block_iter = Some(block::BlockIter::new(block::Block::decode(
+            &mut block_data.as_slice(),
+            entry.block_size as usize,
+        )?));
+        Ok(self.block_iter.as_mut())
     }
 
     fn next_inner(&mut self) -> Result<bool, SstIterError> {
@@ -121,48 +107,25 @@ impl<'a> SstIter<'a> {
             }
             _ => {}
         };
-        let mut block_iter = match &mut self.block_iter {
-            Some(block) => block,
+        let block_iter = match &mut self.block_iter {
+            Some(block_iter) => block_iter,
             None => {
-                if !self.load_block_n(0)? {
+                let Some(block_iter) = self.load_block_n(0)? else {
                     self.set_exhausted();
                     return Ok(false);
-                }
-                self.block_iter.as_mut().unwrap()
+                };
+                block_iter
             }
         };
-        if block_iter.offset >= block_iter.block.data.len() {
-            let next_idx = block_iter.entry_index + 1;
-            if !self.load_block_n(next_idx)? {
-                self.set_exhausted();
-                return Ok(false);
-            }
-            block_iter = self.block_iter.as_mut().unwrap();
+        if block_iter.next()? {
+            return Ok(true);
         }
-        let curr_restart_idx = block_iter.restart_index;
-        if curr_restart_idx < block_iter.block.restart_array.len() as i64 - 1
-            && block_iter.offset
-                == block_iter.block.restart_array[(curr_restart_idx + 1) as usize] as usize
-        {
-            // The offset has reached the next restart point, so update the
-            // index and decode the key-value pair with no prefix.
-            let (key, value, bytes_read) =
-                block::decode_kv_pair(&mut &block_iter.block.data[block_iter.offset..], None)?;
-            block_iter.offset += bytes_read;
-            block_iter.key_prefix = Some(key.clone());
-            block_iter.restart_index += 1;
-            self.key = Some(key);
-            self.value = Some(value);
-        } else {
-            let (key, value, bytes_read) = block::decode_kv_pair(
-                &mut &block_iter.block.data[block_iter.offset..],
-                block_iter.key_prefix.as_ref(),
-            )?;
-            block_iter.offset += bytes_read;
-            self.key = Some(key);
-            self.value = Some(value);
-        }
-        Ok(true)
+        let next_idx = self.entry_index + 1;
+        let Some(block_iter) = self.load_block_n(next_idx)? else {
+            self.set_exhausted();
+            return Ok(false);
+        };
+        Ok(block_iter.next()?)
     }
 
     fn seek_ge_inner<Q>(&mut self, key: &Q) -> Result<bool, SstIterError>
@@ -175,73 +138,15 @@ impl<'a> SstIter<'a> {
             self.set_exhausted();
             return Ok(false);
         };
-        if let Some(curr_block) = &self.block_iter
-            && curr_block.entry_index == entry_index
+        if let Some(block_iter) = &mut self.block_iter
+            && self.entry_index == entry_index
         {
-            // We are already in the correct block, just seek within it.
-            self.seek_ge_in_block(key)?;
-            return Ok(true);
+            return Ok(block_iter.seek_ge(key)?);
         }
-        if !self.load_block_n(entry_index)? {
+        let Some(block_iter) = self.load_block_n(entry_index)? else {
             return Ok(false);
-        }
-        self.seek_ge_in_block(key)?;
-        Ok(true)
-    }
-
-    fn seek_ge_in_block<Q>(&mut self, key: &Q) -> Result<(), SstIterError>
-    where
-        Key: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        let Some(block_iter) = &mut self.block_iter else {
-            whatever!("unexpectedly called seek_ge_in_block with no current block loaded");
         };
-        let mut search_err = None;
-        let search_result = block_iter.block.restart_array.binary_search_by(|offset| {
-            match block::decode_key(&mut &block_iter.block.data[*offset as usize..], None) {
-                Ok((restart_key, _, _)) => restart_key.borrow().cmp(key),
-                Err(e) => {
-                    search_err = Some(e);
-                    std::cmp::Ordering::Equal
-                }
-            }
-        });
-        if let Some(e) = search_err {
-            return Err(e.into());
-        }
-        // We set the restart index to the index *prior* of the restart interval
-        // we wish to seek within, so that we can just re-use the `next_inner()`
-        // logic. Setting to the prior index positions us at the start of the
-        // restart interval.
-        match search_result {
-            Ok(restart_idx) => {
-                block_iter.restart_index = restart_idx as i64 - 1;
-                block_iter.offset = block_iter.block.restart_array[restart_idx] as usize;
-            }
-            Err(restart_idx) => {
-                if restart_idx == 0 {
-                    block_iter.restart_index = -1;
-                    block_iter.offset = 0;
-                } else {
-                    block_iter.restart_index = restart_idx as i64 - 2;
-                    block_iter.offset = block_iter.block.restart_array[restart_idx - 1] as usize;
-                }
-            }
-        };
-        while self.next_inner()? {
-            let Some(curr_key) = &self.key else {
-                whatever!("next_inner returned true but key is None");
-            };
-            if curr_key.borrow() >= key {
-                return Ok(());
-            }
-        }
-        // This technically shouldn't happen, as the index should have
-        // pointed us to a block whose last key is >= the seek key.
-        whatever!(
-            "seek_ge_in_block impossibly reached end of block without finding key >= seek key"
-        );
+        Ok(block_iter.seek_ge(key)?)
     }
 
     fn seek_lt_inner<Q>(&mut self, key: &Q) -> Result<bool, SstIterError>
@@ -268,16 +173,16 @@ impl<'a> SstIter<'a> {
         let Some((_, beta_entry_idx)) = self.sstable.index.key_block(key) else {
             // The key lasts beyond the last key in the index, so case 3.
             let last_block_idx = self.sstable.index.0.len() - 1;
-            if !self.load_block_n(last_block_idx)? {
+            let Some(block_iter) = self.load_block_n(last_block_idx)? else {
                 whatever!("should not happen, as we should have picked a valid block to load");
-            }
-            self.seek_last_key_in_block()?;
+            };
+            block_iter.seek_to_last()?;
             return Ok(true);
         };
-        if !self.load_block_n(beta_entry_idx)? {
+        let Some(block_iter) = self.load_block_n(beta_entry_idx)? else {
             whatever!("should not happen, as we should have picked a valid block to load");
-        }
-        if self.seek_lt_in_block(key)? {
+        };
+        if block_iter.seek_lt(key)? {
             return Ok(true);
         }
         if beta_entry_idx == 0 {
@@ -286,108 +191,15 @@ impl<'a> SstIter<'a> {
             self.set_exhausted();
             return Ok(false);
         }
-        if !self.load_block_n(beta_entry_idx - 1)? {
+        let Some(block_iter) = self.load_block_n(beta_entry_idx - 1)? else {
             return Ok(false);
-        }
-        self.seek_last_key_in_block()?;
+        };
+        block_iter.seek_to_last()?;
         Ok(true)
-    }
-
-    fn seek_lt_in_block<Q>(&mut self, key: &Q) -> Result<bool, SstIterError>
-    where
-        Key: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        let Some(block_iter) = &mut self.block_iter else {
-            whatever!("unexpectedly called seek_lt_in_block with no current block loaded");
-        };
-        let mut search_err = None;
-        let search_result = block_iter.block.restart_array.binary_search_by(|offset| {
-            match block::decode_key(&mut &block_iter.block.data[*offset as usize..], None) {
-                Ok((restart_key, _, _)) => restart_key.borrow().cmp(key),
-                Err(e) => {
-                    search_err = Some(e);
-                    std::cmp::Ordering::Equal
-                }
-            }
-        });
-        if let Some(e) = search_err {
-            return Err(e.into());
-        }
-        // Let i be the index i of some restart interval [α, β). For a given
-        // search key ε, the following cases are possible:
-        // 1. binary_search -> Ok(i)
-        //  - ε = α, so we should seek to the last key in the previous restart
-        //  interval.
-        // 2. binary_search -> Err(i)
-        //  - ε < α, so we should still seek within the previous restart
-        //  interval.
-        let search_restart_idx = match search_result {
-            Ok(i) => i as i64,
-            Err(i) => i as i64,
-        } - 1;
-        if search_restart_idx < 0 {
-            return Ok(false);
-        }
-        block_iter.restart_index = search_restart_idx;
-        block_iter.offset = block_iter.block.restart_array[search_restart_idx as usize] as usize;
-
-        let interval_end = if search_restart_idx + 1 < block_iter.block.restart_array.len() as i64 {
-            block_iter.block.restart_array[(search_restart_idx + 1) as usize] as usize
-        } else {
-            block_iter.block.data.len()
-        };
-        while block_iter.offset < interval_end {
-            let (curr_key, value, bytes_read) = block::decode_kv_pair(
-                &mut &block_iter.block.data[block_iter.offset..],
-                block_iter.key_prefix.as_ref(),
-            )?;
-            if block_iter.key_prefix.is_none() {
-                block_iter.key_prefix = Some(curr_key.clone());
-            }
-            if curr_key.borrow() >= key {
-                if block_iter.offset == 0 {
-                    return Ok(false);
-                }
-                return Ok(true);
-            }
-            block_iter.offset += bytes_read;
-            self.key = Some(curr_key);
-            self.value = Some(value);
-        }
-        // Reached the end of the restart interval without finding a key >= ε,
-        // so the last key in the interval is the largest key < ε.
-        Ok(true)
-    }
-
-    /// Seeks until the iterator is positioned at the last key in the current
-    /// block.
-    fn seek_last_key_in_block(&mut self) -> Result<(), SstIterError> {
-        let Some(block_iter) = &mut self.block_iter else {
-            whatever!("unexpectedly called last_key_in_block with no current block loaded");
-        };
-        block_iter.restart_index = block_iter.block.restart_array.len() as i64 - 1;
-        block_iter.offset =
-            block_iter.block.restart_array[block_iter.restart_index as usize] as usize;
-        block_iter.key_prefix = None;
-        while block_iter.offset < block_iter.block.data.len() {
-            let (key, value, bytes_read) = block::decode_kv_pair(
-                &mut &block_iter.block.data[block_iter.offset..],
-                block_iter.key_prefix.as_ref(),
-            )?;
-            if block_iter.key_prefix.is_none() {
-                block_iter.key_prefix = Some(key.clone());
-            }
-            block_iter.offset += bytes_read;
-            self.key = Some(key);
-            self.value = Some(value);
-        }
-        Ok(())
     }
 
     fn set_exhausted(&mut self) {
-        self.key = None;
-        self.value = None;
+        self.block_iter = None;
         self.state = SstIterState::Exhausted;
     }
 }
@@ -398,11 +210,17 @@ impl<'a> KVIter for SstIter<'a> {
     type Error = SstIterError;
 
     fn key(&self) -> Result<Option<&Self::Key>, Self::Error> {
-        Ok(self.key.as_ref())
+        match &self.block_iter {
+            Some(block_iter) => Ok(block_iter.key()?),
+            None => Ok(None),
+        }
     }
 
     fn value(&self) -> Result<Option<&Self::Value>, Self::Error> {
-        Ok(self.value.as_ref())
+        match &self.block_iter {
+            Some(block_iter) => Ok(block_iter.value()?),
+            None => Ok(None),
+        }
     }
 
     fn next(&mut self) -> Result<bool, Self::Error> {
