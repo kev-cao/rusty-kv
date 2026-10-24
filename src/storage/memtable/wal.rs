@@ -61,7 +61,7 @@ impl FileWal {
     }
 
     /// Opens an existing WAL file at the specified path for appending. This
-    /// will fail if no fle exists at the path.
+    /// will fail if no file exists at the path.
     pub fn open(path: impl Into<path::PathBuf>, mode: SyncMode) -> Result<Self, WalError> {
         let path = path.into();
         Ok(Self {

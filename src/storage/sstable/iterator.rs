@@ -75,7 +75,7 @@ impl<'a> SstIter<'a> {
     }
 
     /// Loads the block at the given index into the iterator. Returns the loaded
-    /// iter if succesful, or None if the index is out of bounds.
+    /// iter if successful, or None if the index is out of bounds.
     fn load_block_n(&mut self, n: usize) -> Result<Option<&mut block::BlockIter>, SstIterError> {
         let Some(entry) = self.sstable.index.0.get(n) else {
             self.state = SstIterState::Exhausted;
