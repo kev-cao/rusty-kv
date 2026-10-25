@@ -38,11 +38,6 @@ impl Block {
         }
     }
 
-    /// Returns the size of the block on disk in bytes.
-    pub fn block_size(&self) -> usize {
-        self.data.len()
-    }
-
     /// Encodes the block to the given writer. Returns the number of bytes
     /// written.
     pub fn encode(&self, writer: &mut impl io::Write) -> Result<usize, io::Error> {
@@ -193,6 +188,7 @@ impl KVIter for BlockIter {
         Self::Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        self.key_prefix = None;
         let mut search_err = None;
         let search_result = self.block.restart_array.binary_search_by(|&offset| {
             match decode_key(&mut &self.block.data[offset as usize..], None) {
@@ -242,6 +238,7 @@ impl KVIter for BlockIter {
         Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
+        self.key_prefix = None;
         let mut search_err = None;
         let search_result = self.block.restart_array.binary_search_by(|&offset| {
             match decode_key(&mut &self.block.data[offset as usize..], None) {
