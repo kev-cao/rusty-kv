@@ -54,7 +54,7 @@ pub struct SstIter<'a> {
     sstable: &'a SsTable,
     entry_index: usize,
     /// The iterator for the current block. If None, no block has been loaded.
-    block_iter: Option<block::BlockIter>,
+    block_iter: Option<block::BlockIter<Box<block::Block>>>,
     state: SstIterState,
 }
 
@@ -76,24 +76,16 @@ impl<'a> SstIter<'a> {
 
     /// Loads the block at the given index into the iterator. Returns the loaded
     /// iter if successful, or None if the index is out of bounds.
-    fn load_block_n(&mut self, n: usize) -> Result<Option<&mut block::BlockIter>, SstIterError> {
-        let Some(entry) = self.sstable.index.0.get(n) else {
+    fn load_block_n(
+        &mut self,
+        n: usize,
+    ) -> Result<Option<&mut block::BlockIter<Box<block::Block>>>, SstIterError> {
+        let Some(block) = self.sstable.load_block(n)? else {
             self.state = SstIterState::Exhausted;
             return Ok(None);
         };
-
-        let mut block_data = vec![0; entry.block_size as usize];
-        self.sstable
-            .file
-            .read_exact_at(block_data.as_mut_slice(), entry.block_offset)
-            .inspect_err(|_| {
-                self.block_iter = None;
-            })?;
         self.entry_index = n;
-        self.block_iter = Some(block::BlockIter::new(block::Block::decode(
-            &mut block_data.as_slice(),
-            entry.block_size as usize,
-        )?));
+        self.block_iter = Some(block::BlockIter::new(Box::new(block)));
         Ok(self.block_iter.as_mut())
     }
 

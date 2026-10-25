@@ -39,7 +39,7 @@ pub fn create_random_sstable(num_entries: u32, mut rng: impl Rng) -> TestResult<
     // generate random keys but prefix them with a monotonically increasing
     // number to ensure they are sorted.
     for (prefix, _) in (0..num_entries).enumerate() {
-        let key_len = rng.random_range(0..=MAX_TEST_KEY_LEN - size_of_val(&num_entries));
+        let key_len = rng.random_range(0..=MAX_TEST_KEY_LEN);
         let val_len = rng.random_range(0..=MAX_TEST_VAL_LEN);
         let key = key(&[
             &prefix.to_be_bytes(),

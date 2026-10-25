@@ -1,6 +1,6 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::borrow::Borrow;
 use std::io;
+use std::{borrow::Borrow, ops::Deref};
 
 use crate::storage::{
     collections::KVIter,
@@ -35,6 +35,52 @@ impl Block {
         Self {
             data: Vec::new(),
             restart_array: Vec::new(),
+        }
+    }
+
+    /// Gets the value associated with the given key, if it exists in the block.
+    pub fn get<Q>(&self, key: &Q) -> Result<Option<Value>, BlockIterError>
+    where
+        Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut search_err = None;
+        let search_result = self.restart_array.binary_search_by(|&offset| {
+            match decode_key(&mut &self.data[offset as usize..], None) {
+                Ok((restart_key, _, _)) => restart_key.borrow().cmp(key),
+                Err(e) => {
+                    search_err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = search_err {
+            return Err(e.into());
+        }
+        match search_result {
+            Ok(restart_idx) => {
+                let offset = self.restart_array[restart_idx] as usize;
+                let (value, _) = decode_value(&mut io::Cursor::new(&self.data[offset..]))?;
+                Ok(Some(value))
+            }
+            Err(restart_idx) => {
+                let mut iter = BlockIter::new(self);
+                iter.seek_to_restart_index(restart_idx.saturating_sub(1))?;
+                let end_offset = match self.restart_array.get(restart_idx) {
+                    Some(next_offset) => *next_offset as usize,
+                    None => self.data.len(),
+                };
+                while iter.offset < end_offset {
+                    iter.next()?;
+                    let Some(curr_key) = &iter.key else {
+                        return Ok(None);
+                    };
+                    if curr_key.borrow() == key {
+                        return Ok(iter.value()?.cloned());
+                    }
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -88,6 +134,10 @@ impl Block {
             restart_array,
         })
     }
+
+    pub fn kv_iter(&self) -> BlockIter<&Self> {
+        BlockIter::new(self)
+    }
 }
 
 #[derive(Snafu, Debug)]
@@ -95,6 +145,11 @@ pub enum BlockIterError {
     #[snafu(context(false), display("block io operation failed"))]
     Io {
         source: io::Error,
+        backtrace: snafu::Backtrace,
+    },
+    #[snafu(context(false), display("bad cast"))]
+    Cast {
+        source: std::num::TryFromIntError,
         backtrace: snafu::Backtrace,
     },
     #[snafu(whatever, display("{message}"))]
@@ -105,25 +160,25 @@ pub enum BlockIterError {
     },
 }
 
-pub struct BlockIter {
+pub struct BlockIter<B: Deref<Target = Block>> {
+    block: B,
     key: Option<Key>,
     value: Option<Value>,
-    block: Block,
     /// Restart index represents the index of the restart point that the cursor
     /// is currently at. When a cursor is at the beginning of a block and has
     /// yet to visit the first key, the restart index is -1.
-    restart_index: i64,
+    restart_index: usize,
     key_prefix: Option<Key>,
     offset: usize,
 }
 
-impl BlockIter {
-    pub fn new(block: Block) -> Self {
+impl<B: Deref<Target = Block>> BlockIter<B> {
+    pub fn new(block: B) -> Self {
         Self {
             key: None,
             value: None,
             block,
-            restart_index: -1,
+            restart_index: 0,
             key_prefix: None,
             offset: 0,
         }
@@ -133,16 +188,28 @@ impl BlockIter {
         if self.block.restart_array.is_empty() {
             return Ok(false);
         }
-        self.restart_index = (self.block.restart_array.len() - 1) as i64;
-        self.offset = self.block.restart_array[self.restart_index as usize] as usize;
+        self.restart_index = self.block.restart_array.len().saturating_sub(1);
+        self.offset = self.block.restart_array[self.restart_index] as usize;
         while self.offset < self.block.data.len() {
             self.next()?;
         }
         Ok(true)
     }
+
+    /// Positions the iterator at the given restart index. Returns false if the
+    /// restart index is out of bounds.
+    fn seek_to_restart_index(&mut self, restart_index: usize) -> Result<bool, BlockIterError> {
+        if restart_index >= self.block.restart_array.len() {
+            return Ok(false);
+        }
+        self.restart_index = restart_index;
+        self.offset = self.block.restart_array[restart_index] as usize;
+        self.key_prefix = None;
+        Ok(true)
+    }
 }
 
-impl KVIter for BlockIter {
+impl<B: Deref<Target = Block>> KVIter for BlockIter<B> {
     type Key = Key;
     type Value = Value;
     type Error = BlockIterError;
@@ -161,10 +228,7 @@ impl KVIter for BlockIter {
             self.value = None;
             return Ok(false);
         }
-        if let Some(next_restart) = self
-            .block
-            .restart_array
-            .get((self.restart_index + 1) as usize)
+        if let Some(next_restart) = self.block.restart_array.get(self.restart_index + 1)
             && self.offset >= *next_restart as usize
         {
             self.restart_index += 1;
@@ -209,17 +273,10 @@ impl KVIter for BlockIter {
         // restart interval.
         match search_result {
             Ok(restart_idx) => {
-                self.restart_index = restart_idx as i64 - 1;
-                self.offset = self.block.restart_array[restart_idx] as usize;
+                self.seek_to_restart_index(restart_idx.saturating_sub(1))?;
             }
             Err(restart_idx) => {
-                if restart_idx == 0 {
-                    self.restart_index = -1;
-                    self.offset = 0;
-                } else {
-                    self.restart_index = restart_idx as i64 - 1;
-                    self.offset = self.block.restart_array[restart_idx - 1] as usize;
-                }
+                self.seek_to_restart_index(restart_idx.saturating_sub(1))?;
             }
         };
         while self.next()? {
@@ -268,11 +325,11 @@ impl KVIter for BlockIter {
         if search_restart_idx < 0 {
             return Ok(false);
         }
-        self.restart_index = search_restart_idx;
+        self.restart_index = search_restart_idx as usize;
         self.offset = self.block.restart_array[search_restart_idx as usize] as usize;
 
-        let interval_end = if (self.restart_index + 1) < self.block.restart_array.len() as i64 {
-            self.block.restart_array[(self.restart_index + 1) as usize] as usize
+        let interval_end = if (self.restart_index + 1) < self.block.restart_array.len() {
+            self.block.restart_array[self.restart_index + 1] as usize
         } else {
             self.block.data.len()
         };
@@ -478,6 +535,19 @@ pub fn decode_key(
     Ok((Key(full_key), value_len, bytes_read))
 }
 
+/// Decodes just the value from an SSTable block. Returns the value and the
+/// amount of bytes read.
+/// NB: This assumes the reader is positioned at the start of a serialized
+/// key-value pair in an SSTable block.
+pub fn decode_value<R: io::Read + io::Seek>(reader: &mut R) -> Result<(Value, usize), io::Error> {
+    let (_, key_delta_len, value_len, mut bytes_read) = decode_kv_meta(reader)?;
+    reader.seek(io::SeekFrom::Current(key_delta_len as i64))?;
+    bytes_read += key_delta_len as usize + value_len as usize;
+    let mut value = vec![0u8; value_len as usize];
+    reader.read_exact(&mut value)?;
+    Ok((Value(value), bytes_read))
+}
+
 /// Decodes only the metadata of a key-value pair from an SSTable block. This is
 /// useful for skipping over key-value pairs without reading the entire key and
 /// value into memory. Returns a tuple of (prefix_len, key_delta_len,
@@ -503,7 +573,7 @@ mod tests {
     use super::*;
     use crate::storage::kv::Key;
     use crate::testutils::{TestResult, key, value};
-    use rstest::rstest;
+    use rstest::{fixture, rstest};
     use std::assert_matches;
 
     #[rstest]
@@ -635,5 +705,142 @@ mod tests {
             "decoded block restart array should match original"
         );
         Ok(())
+    }
+
+    #[rstest]
+    fn get(default_kvs: Vec<(Key, Value)>) -> TestResult<()> {
+        let opts = BlockBuilderOpts::default();
+        let mut builder = BlockBuilder::new(opts);
+        for (key, value) in &default_kvs {
+            builder.add_kv(key, value)?;
+        }
+        let block = builder.finish()?;
+
+        for (key, value) in &default_kvs {
+            unsafe {
+                if String::from_utf8_unchecked(key.0.clone()) == "grappling" {
+                    println!("Debug: key = {:?}, value = {:?}", key, value);
+                }
+            }
+            let Some(retrieved_value) = block.get(key)? else {
+                panic!(
+                    "key {:?} should exist in block",
+                    String::from_utf8(key.0.clone())
+                );
+            };
+            assert_eq!(
+                retrieved_value, *value,
+                "retrieved value should match original"
+            );
+        }
+
+        let non_existent_key = key(b"bananas");
+        let result = block.get(&non_existent_key)?;
+        assert!(result.is_none(), "non-existent key should return None");
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::seek_to_existing_key(key(b"banana"), Some(key(b"banana")))]
+    #[case::seek_to_before_key(key(b"bad apple"), Some(key(b"banana")))]
+    #[case::seek_to_first_key(key(b"apple"), Some(key(b"apple")))]
+    #[case::seek_to_before_first_key(key(b"acerola"), Some(key(b"apple")))]
+    #[case::seek_to_last_key(key(b"xray"), Some(key(b"xray")))]
+    #[case::seek_to_after_last_key(key(b"zebra"), None)]
+    fn seek_ge(
+        default_kvs: Vec<(Key, Value)>,
+        #[case] seek_key: Key,
+        #[case] expected_key: Option<Key>,
+    ) -> TestResult<()> {
+        let opts = BlockBuilderOpts::default();
+        let mut builder = BlockBuilder::new(opts);
+        for (key, value) in &default_kvs {
+            builder.add_kv(key, value)?;
+        }
+        let block = builder.finish()?;
+        let mut iter = block.kv_iter();
+        let found = iter.seek_ge(&seek_key)?;
+        if let Some(expected_key) = expected_key {
+            assert!(found, "expected to find a key >= {:?}", seek_key);
+            let retrieved_key = iter.key()?.expect("key should exist");
+            assert_eq!(
+                *retrieved_key, expected_key,
+                "retrieved key should match expected"
+            );
+        } else {
+            assert!(!found, "expected not to find a key >= {:?}", seek_key);
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::seek_to_existing_key(key(b"floccipend"), Some(key(b"floccinaucinihilipilification")))]
+    #[case::seek_to_between_keys(key(b"axe"), Some(key(b"approximate")))]
+    #[case::seek_to_first_key(key(b"apple"), None)]
+    #[case::seek_to_before_first_key(key(b"acerola"), None)]
+    #[case::seek_to_last_key(key(b"xray"), Some(key(b"transcription")))]
+    #[case::seek_to_after_last_key(key(b"zebra"), Some(key(b"xray")))]
+    fn seek_lt(
+        default_kvs: Vec<(Key, Value)>,
+        #[case] seek_key: Key,
+        #[case] expected_key: Option<Key>,
+    ) -> TestResult<()> {
+        let opts = BlockBuilderOpts::default();
+        let mut builder = BlockBuilder::new(opts);
+        for (key, value) in &default_kvs {
+            builder.add_kv(key, value)?;
+        }
+        let block = builder.finish()?;
+        let mut iter = block.kv_iter();
+        let found = iter.seek_lt(&seek_key)?;
+        if let Some(expected_key) = expected_key {
+            assert!(found, "expected to find a key < {:?}", seek_key);
+            let retrieved_key = iter.key()?.expect("key should exist");
+            assert_eq!(
+                *retrieved_key, expected_key,
+                "retrieved key should match expected"
+            );
+        } else {
+            assert!(!found, "expected not to find a key < {:?}", seek_key);
+        }
+        Ok(())
+    }
+
+    #[fixture]
+    fn default_kvs() -> Vec<(Key, Value)> {
+        vec![
+            (key(b"apple"), value(b"noun")),
+            (key(b"application"), value(b"noun")),
+            (key(b"apply"), value(b"verb")),
+            (key(b"appraise"), value(b"verb")),
+            (key(b"apprentice"), value(b"noun")),
+            (key(b"approximate"), value(b"adjective")),
+            (key(b"banana"), value(b"noun")),
+            (key(b"bandana"), value(b"noun")),
+            (key(b"cabbage"), value(b"noun")),
+            (key(b"carry"), value(b"verb")),
+            (key(b"cloudy"), value(b"adjective")),
+            (key(b"exceptional"), value(b"adjective")),
+            (key(b"floccinaucinihilipilification"), value(b"noun")),
+            (key(b"floccipend"), value(b"verb")),
+            (key(b"graph"), value(b"noun")),
+            (key(b"graphical"), value(b"adjective")),
+            (key(b"graphite"), value(b"noun")),
+            (key(b"grappling"), value(b"noun")),
+            (key(b"grateful"), value(b"adjective")),
+            (key(b"gravity"), value(b"noun")),
+            (key(b"harbor"), value(b"noun")),
+            (key(b"harmonious"), value(b"adjective")),
+            (key(b"harmonize"), value(b"verb")),
+            (key(b"harpoon"), value(b"noun")),
+            (key(b"helicopter"), value(b"noun")),
+            (key(b"knowledge"), value(b"noun")),
+            (key(b"transact"), value(b"verb")),
+            (key(b"transaction"), value(b"noun")),
+            (key(b"transactional"), value(b"adjective")),
+            (key(b"transcribe"), value(b"verb")),
+            (key(b"transcription"), value(b"noun")),
+            (key(b"xray"), value(b"noun")),
+        ]
     }
 }

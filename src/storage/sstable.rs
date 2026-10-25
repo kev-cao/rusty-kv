@@ -10,6 +10,7 @@ use snafu::prelude::*;
 use std::{
     fs,
     io::{self, Seek, SeekFrom, Write},
+    os::unix::fs::FileExt,
     path::{self, PathBuf},
 };
 
@@ -39,6 +40,11 @@ pub enum SsTableError {
     #[snafu(display("{reason}"))]
     Corruption {
         reason: String,
+        backtrace: snafu::Backtrace,
+    },
+    #[snafu(context(false), display("Error decoding SSTable block: {source}"))]
+    BlockIter {
+        source: block::BlockIterError,
         backtrace: snafu::Backtrace,
     },
 }
@@ -92,9 +98,38 @@ impl SsTable {
         self.filter.contains(key.as_ref())
     }
 
+    /// Gets the value associated with the given key in the SSTable. Returns
+    /// None if the key is not present.
+    pub fn get(&mut self, key: &Key) -> Result<Option<Value>, SsTableError> {
+        if !self.contains(key) {
+            return Ok(None);
+        }
+        let Some((_, entry_idx)) = self.index.key_block(key) else {
+            return Ok(None);
+        };
+        let block = self.load_block(entry_idx)?;
+        let Some(block) = block else {
+            return Ok(None);
+        };
+        Ok(block.get(key)?)
+    }
+
     /// Returns an iterator over the key-value pairs in the SSTable.
-    pub fn kv_iter<'a>(&'a self) -> iterator::SstIter<'a> {
+    pub fn kv_iter(&self) -> iterator::SstIter {
         iterator::SstIter::new(self)
+    }
+
+    /// Loads a block from the SSTable file at the given index. Returns None if
+    /// the index is out of bounds. Returns an error if the block cannot be
+    /// loaded.
+    fn load_block(&self, entry_idx: usize) -> Result<Option<block::Block>, SsTableError> {
+        let Some(entry) = self.index.0.get(entry_idx) else {
+            return Ok(None);
+        };
+        let mut data = vec![0u8; entry.block_size as usize];
+        self.file.read_exact_at(&mut data, entry.block_offset)?;
+        let block = block::Block::decode(&mut data.as_slice(), entry.block_size as usize)?;
+        Ok(Some(block))
     }
 }
 
@@ -207,7 +242,7 @@ impl SstBuilder {
 mod tests {
     use super::testutils::*;
     use super::*;
-    use crate::testutils::{TestResult, generate_rand_bytes, key, seeded_rng, value};
+    use crate::testutils::{TestResult, key, seeded_rng, value};
     use tempfile::tempdir;
 
     #[test]
@@ -241,8 +276,38 @@ mod tests {
         for (key, _) in entries {
             assert!(sstable.contains(&key));
         }
-        let non_existing_key = key(&generate_rand_bytes(10, &mut rng));
-        assert!(!sstable.contains(&non_existing_key));
+        let mut missing_key = sstable
+            .index
+            .0
+            .last()
+            .map(|entry| entry.last_key.clone())
+            .expect("index should not be empty");
+        missing_key.0.extend(b"non_existing_key");
+        assert!(!sstable.contains(&missing_key));
+        Ok(())
+    }
+
+    #[test]
+    fn get() -> TestResult<()> {
+        let (mut rng, _) = seeded_rng(None);
+        let SstFixture {
+            dir: _,
+            filepath: _,
+            mut sstable,
+            entries,
+        } = create_random_sstable(100, &mut rng)?;
+        for (key, value) in entries {
+            let retrieved_value = sstable.get(&key)?.expect("value should exist");
+            assert_eq!(retrieved_value, value);
+        }
+        let mut missing_key = sstable
+            .index
+            .0
+            .last()
+            .map(|entry| entry.last_key.clone())
+            .expect("index should not be empty");
+        missing_key.0.extend(b"non_existing_key");
+        assert!(sstable.get(&missing_key)?.is_none());
         Ok(())
     }
 }
